@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#071310" />
+    <meta name="description" content="Интерактивный трехмерный мир из гексагональных плиток" />
+    <title>Hexaterra | Гексагональный остров</title>
+  </head>
+  <body>
+    <main id="app">
+      <canvas id="world" aria-label="Интерактивная трехмерная карта острова"></canvas>
+
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Hexaterra">
+          <svg class="brand__mark" viewBox="0 0 42 42" aria-hidden="true">
+            <path d="M21 2.7 36.8 11.8v18.4L21 39.3 5.2 30.2V11.8L21 2.7Z" />
+            <path d="m21 10.8 8.8 5.1v10.2L21 31.2l-8.8-5.1V15.9l8.8-5.1Z" />
+          </svg>
+          <span>
+            <strong>HEXATERRA</strong>
+            <small>ISLAND EXPLORER</small>
+          </span>
+        </a>
+
+        <div class="world-state">
+          <span class="world-state__dot"></span>
+          <span>МИР ЗАГРУЖЕН</span>
+          <span class="world-state__divider"></span>
+          <span id="tile-count">127 ГЕКСОВ</span>
+        </div>
+
+        <button class="icon-button" id="reset-view" type="button" aria-label="Сбросить камеру" title="Сбросить камеру">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 4v6h6M20 20v-6h-6" />
+            <path d="M5.8 15a7 7 0 0 0 11.7 2.5L20 14M4 10l2.5-3.5A7 7 0 0 1 18.2 9" />
+          </svg>
+        </button>
+      </header>
+
+      <aside class="info-panel" id="info-panel">
+        <div class="eyebrow"><span></span> КАРТОГРАФИЯ / 01</div>
+        <h1>Остров<br /><em>Эйра</em></h1>
+        <p class="lead">Архипелаг, собранный из живых гексагональных ячеек. Исследуйте рельеф и отмечайте территории.</p>
+
+        <div class="coordinates">
+          <div>
+            <span>ШИРОТА</span>
+            <strong>61.5240° N</strong>
+          </div>
+          <div>
+            <span>ДОЛГОТА</span>
+            <strong>18.7342° E</strong>
+          </div>
+        </div>
+
+        <div class="selection" id="selection-card">
+          <div class="selection__icon">
+            <svg viewBox="0 0 32 32" aria-hidden="true"><path d="m16 3 11 6.5v13L16 29 5 22.5v-13L16 3Z" /></svg>
+          </div>
+          <div>
+            <span id="selection-label">ВЫБРАННАЯ ЯЧЕЙКА</span>
+            <strong id="selection-name">Ничего не выбрано</strong>
+            <small id="selection-meta">Нажмите на гекс карты</small>
+          </div>
+        </div>
+      </aside>
+
+      <div class="height-scale" aria-label="Шкала высот">
+        <span>ВЫСОТА</span>
+        <div class="height-scale__bar"></div>
+        <div class="height-scale__labels"><small>640 М</small><small>0 М</small></div>
+      </div>
+
+      <div class="compass" aria-hidden="true">
+        <span>С</span>
+        <div class="compass__dial" id="compass-dial">
+          <i></i><i></i><i></i><i></i>
+          <b></b>
+        </div>
+      </div>
+
+      <div class="controls-help">
+        <div><i class="mouse mouse--left"></i><span><b>ЛКМ + ДВИЖЕНИЕ</b>ВРАЩАТЬ</span></div>
+        <div><i class="mouse mouse--right"></i><span><b>ПКМ + ДВИЖЕНИЕ</b>ПЕРЕМЕЩАТЬ</span></div>
+        <div><i class="wheel"></i><span><b>КОЛЕСО</b>МАСШТАБ</span></div>
+      </div>
+
+      <div class="loading" id="loading">
+        <svg viewBox="0 0 60 60" aria-hidden="true"><path d="m30 3 23.4 13.5v27L30 57 6.6 43.5v-27L30 3Z" /></svg>
+        <span>ФОРМИРУЕМ РЕЛЬЕФ</span>
+      </div>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

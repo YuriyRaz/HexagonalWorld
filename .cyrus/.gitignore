@@ -1,0 +1,35 @@
+# Cyrus
+# ─────
+# Streaming session logs (huge, regenerable from replay).
+missions/*/[0-9]*-live.*
+missions/*/tails/
+
+# Per-iteration bookkeeping (durable trajectory is in ledger.md + summary.md
+# + checklist.json; per-iter task/result/review is replayable from session).
+missions/*/[0-9]*-task.md
+missions/*/[0-9]*-result.md
+missions/*/[0-9]*-review.md
+missions/*/[0-9]*-intervention.md
+missions/*/[0-9]*-notice.json
+missions/*/[0-9]*-notice.stale-*.json
+
+# Process locks and heartbeats (machine-specific, ephemeral).
+missions/*/.lock
+missions/*/.driving
+
+# Diagnostic envelopes (large, debugging only).
+missions/*/diagnostics/
+
+# Verbatim user pastes — may contain secrets/paths/API logs.
+# Remove this line to commit user evidence with the mission.
+missions/*/inbox/
+
+# Planning-phase uploads (screenshots, PDFs, attached binaries).
+# Remove this line to commit attached reference material with the mission.
+missions/*/attachments/
+
+# Workspace event log (useful locally, grows forever).
+log.jsonl
+
+# Doer pre-consult worktree — full HEAD checkout, temporary.
+.consult-*/
