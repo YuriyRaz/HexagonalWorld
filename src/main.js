@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { generateSchoolData } from './data.js';
+import { drawIsland } from './island.js';
 import './style.css';
 
 const canvas = document.querySelector('#world');
@@ -70,124 +72,13 @@ const world = new THREE.Group();
 world.position.x = 3.3;
 scene.add(world);
 
-const HEX_SIZE = 1.14;
-const MAP_RADIUS = 6;
-const WATER_LEVEL = 0.12;
-const tiles = [];
+const students = generateSchoolData();
+const { tiles, water, waterRings } = drawIsland(world, students);
+
 let hoveredTile = null;
 let selectedTile = null;
 
-const palette = {
-  sand: new THREE.Color(0xa4a878),
-  meadow: new THREE.Color(0x6d9a5d),
-  forest: new THREE.Color(0x3d7650),
-  highland: new THREE.Color(0x738e68),
-  peak: new THREE.Color(0xb8c2a1),
-};
-
-function noise(q, r) {
-  const a = Math.sin(q * 12.9898 + r * 78.233) * 43758.5453;
-  const b = Math.sin(q * 3.17 - r * 5.71 + 1.2) * 1437.1;
-  return ((a - Math.floor(a)) * 0.66 + (b - Math.floor(b)) * 0.34) * 2 - 1;
-}
-
-function smoothNoise(q, r) {
-  return noise(q, r) * 0.56 + (
-    noise(q + 1, r) + noise(q - 1, r) + noise(q, r + 1) + noise(q, r - 1)
-  ) * 0.11;
-}
-
-function getBiome(height, detail) {
-  if (height < 0.8) return ['Песчаная отмель', palette.sand, 'ПОБЕРЕЖЬЕ'];
-  if (height < 1.8) return ['Луговая терраса', palette.meadow, 'РАВНИНА'];
-  if (height < 3.1) return detail > 0.08
-    ? ['Северный лес', palette.forest, 'ЛЕС']
-    : ['Зеленое плато', palette.meadow, 'ПЛАТО'];
-  if (height < 4.25) return ['Каменное нагорье', palette.highland, 'НАГОРЬЕ'];
-  return ['Белая вершина', palette.peak, 'ВЕРШИНА'];
-}
-
-function addTile(q, r) {
-  const distance = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
-  const radial = 1 - distance / (MAP_RADIUS + 0.75);
-  const detail = smoothNoise(q, r);
-  const ridge = Math.max(0, 1 - Math.hypot(q + 0.8, r - 0.3) / 6.3);
-  const height = Math.max(0.48, 0.42 + radial * 3.4 + ridge * 1.35 + detail * 1.15);
-  const [name, baseColor, type] = getBiome(height, detail);
-
-  const x = HEX_SIZE * Math.sqrt(3) * (q + r / 2);
-  const z = HEX_SIZE * 1.5 * r;
-  const depth = height + 1.4;
-  const geometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, depth, 6, 1, false);
-
-  const color = baseColor.clone().offsetHSL(detail * 0.025, detail * 0.04, detail * 0.035);
-  const material = new THREE.MeshStandardMaterial({
-    color,
-    roughness: 0.84,
-    metalness: 0.02,
-    emissive: 0x000000,
-    emissiveIntensity: 0,
-    flatShading: true,
-  });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.position.set(x, height / 2 - 0.62, z);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  mesh.userData = { q, r, height, name, type, baseColor: color.clone() };
-  world.add(mesh);
-  tiles.push(mesh);
-
-  const edgeGeometry = new THREE.EdgesGeometry(geometry, 20);
-  const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xbfd1a5, transparent: true, opacity: 0.085 });
-  const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-  mesh.add(edges);
-}
-
-for (let q = -MAP_RADIUS; q <= MAP_RADIUS; q += 1) {
-  const rMin = Math.max(-MAP_RADIUS, -q - MAP_RADIUS);
-  const rMax = Math.min(MAP_RADIUS, -q + MAP_RADIUS);
-  for (let r = rMin; r <= rMax; r += 1) addTile(q, r);
-}
-
-tileCount.textContent = `${tiles.length} ГЕКСОВ`;
-
-const waterGeometry = new THREE.CircleGeometry(42, 96);
-const waterMaterial = new THREE.MeshPhysicalMaterial({
-  color: 0x143f3d,
-  roughness: 0.27,
-  metalness: 0.08,
-  transparent: true,
-  opacity: 0.86,
-  transmission: 0.05,
-  clearcoat: 0.35,
-  clearcoatRoughness: 0.34,
-  side: THREE.DoubleSide,
-});
-const water = new THREE.Mesh(waterGeometry, waterMaterial);
-water.rotation.x = -Math.PI / 2;
-water.position.y = WATER_LEVEL;
-water.receiveShadow = true;
-world.add(water);
-
-const ringMaterial = new THREE.MeshBasicMaterial({ color: 0x77b1a0, transparent: true, opacity: 0.065, side: THREE.DoubleSide });
-const waterRings = [];
-for (let i = 0; i < 7; i += 1) {
-  const ring = new THREE.Mesh(new THREE.RingGeometry(12.8 + i * 2.8, 12.84 + i * 2.8, 96), ringMaterial.clone());
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.y = WATER_LEVEL + 0.012;
-  ring.scale.y = 0.82;
-  ring.material.opacity = 0.05 - i * 0.004;
-  world.add(ring);
-  waterRings.push(ring);
-}
-
-const groundGlow = new THREE.Mesh(
-  new THREE.CircleGeometry(25, 72),
-  new THREE.MeshBasicMaterial({ color: 0x3e9a79, transparent: true, opacity: 0.05, blending: THREE.AdditiveBlending, depthWrite: false })
-);
-groundGlow.rotation.x = -Math.PI / 2;
-groundGlow.position.y = WATER_LEVEL + 0.02;
-world.add(groundGlow);
+tileCount.textContent = `${tiles.length} УЧЕНИКОВ`;
 
 const particlesGeometry = new THREE.BufferGeometry();
 const particlePositions = [];
@@ -212,10 +103,19 @@ function setTileState(tile) {
   if (!tile) return;
   const isSelected = tile === selectedTile;
   const isHovered = tile === hoveredTile;
-  tile.material.color.copy(tile.userData.baseColor);
-  tile.material.emissive.set(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x000000);
-  tile.material.emissiveIntensity = isSelected ? 0.43 : isHovered ? 0.24 : 0;
-  tile.scale.setScalar(isSelected ? 1.035 : isHovered ? 1.018 : 1);
+  
+  if (tile.userData.isEmpty) {
+    const edges = tile.children[0];
+    if (edges && edges.material) {
+      edges.material.opacity = isSelected ? 0.8 : isHovered ? 0.5 : 0.15;
+      edges.material.color.setHex(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x4fa98c);
+    }
+  } else {
+    tile.material.color.copy(tile.userData.baseColor);
+    tile.material.emissive.set(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x000000);
+    tile.material.emissiveIntensity = isSelected ? 0.43 : isHovered ? 0.24 : 0;
+    tile.scale.setScalar(isSelected ? 1.035 : isHovered ? 1.018 : 1);
+  }
 }
 
 function updateHover() {
@@ -242,10 +142,16 @@ function selectTile(tile) {
     return;
   }
 
-  const { q, r, height, name, type } = selectedTile.userData;
+  const { q, r, student, isEmpty } = selectedTile.userData;
   selectionCard.classList.add('is-active');
-  selectionName.textContent = name;
-  selectionMeta.textContent = `${type} · ${Math.round(height * 128)} М · [${q}; ${r}]`;
+  
+  if (isEmpty) {
+    selectionName.textContent = 'Свободное место';
+    selectionMeta.textContent = `Координаты: [${q}; ${r}]`;
+  } else {
+    selectionName.textContent = student.name;
+    selectionMeta.textContent = `Класс: ${student.className} · [${q}; ${r}]`;
+  }
 }
 
 canvas.addEventListener('pointermove', (event) => {
