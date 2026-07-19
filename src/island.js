@@ -2,6 +2,19 @@ import * as THREE from 'three';
 
 const HEX_SIZE = 1.14;
 const WATER_LEVEL = 0.12;
+const ISLAND_DISTANCE = 7;
+const WORLD_RADIUS = 11;
+const MIN_TILE_HEIGHT = 0.55;
+const MAX_TILE_HEIGHT = 6.2;
+
+const islandDirections = [
+  { q: 0, r: -1 },
+  { q: 1, r: -1 },
+  { q: 1, r: 0 },
+  { q: 0, r: 1 },
+  { q: -1, r: 1 },
+  { q: -1, r: 0 },
+];
 
 const palette = [
   new THREE.Color(0xa4a878), // Class 0
@@ -47,95 +60,98 @@ function* getHexSpiral() {
 
 export function drawIsland(world, students) {
   const tiles = [];
-  const N = students.length;
-  // Calculate approximate map radius needed for N tiles
-  const MAP_RADIUS = Math.ceil((-3 + Math.sqrt(9 - 12 * (1 - N))) / 6);
-  
-  const spiral = getHexSpiral();
+  const occupiedCells = new Set();
+  const classes = Map.groupBy(students, (student) => student.classIndex);
 
-  for (let i = 0; i < N; i++) {
-    const student = students[i];
-    const { q, r } = spiral.next().value;
+  [...classes.values()].forEach((classStudents, islandIndex) => {
+    const direction = islandDirections[islandIndex % islandDirections.length];
+    const islandQ = direction.q * ISLAND_DISTANCE;
+    const islandR = direction.r * ISLAND_DISTANCE;
+    const spiral = getHexSpiral();
 
-    const distance = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
-    const radial = 1 - distance / (MAP_RADIUS + 0.75);
-    const detail = smoothNoise(q, r);
-    const ridge = Math.max(0, 1 - Math.hypot(q + 0.8, r - 0.3) / 6.3);
-    const height = Math.max(0.48, 0.42 + radial * 3.4 + ridge * 1.35 + detail * 1.15);
-    
-    const baseColor = palette[student.classIndex % palette.length];
+    classStudents.forEach((student) => {
+      const localCell = spiral.next().value;
+      const q = islandQ + localCell.q;
+      const r = islandR + localCell.r;
+      const detail = smoothNoise(q, r);
+      const normalizedMark = THREE.MathUtils.clamp(student.mark, 0, 100) / 100;
+      const height = MIN_TILE_HEIGHT + normalizedMark * (MAX_TILE_HEIGHT - MIN_TILE_HEIGHT);
+      const baseColor = palette[student.classIndex % palette.length];
+      const x = HEX_SIZE * Math.sqrt(3) * (q + r / 2);
+      const z = HEX_SIZE * 1.5 * r;
+      const depth = height + 1.4;
+      const geometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, depth, 6, 1, false);
+      const color = baseColor.clone().offsetHSL(detail * 0.025, detail * 0.04, detail * 0.035);
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.84,
+        metalness: 0.02,
+        emissive: 0x000000,
+        emissiveIntensity: 0,
+        flatShading: true,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, height / 2 - 0.62, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.userData = {
+        q,
+        r,
+        height,
+        student,
+        baseColor: color.clone(),
+      };
 
-    const x = HEX_SIZE * Math.sqrt(3) * (q + r / 2);
-    const z = HEX_SIZE * 1.5 * r;
-    const depth = height + 1.4;
-    const geometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, depth, 6, 1, false);
+      world.add(mesh);
+      tiles.push(mesh);
+      occupiedCells.add(`${q},${r}`);
 
-    const color = baseColor.clone().offsetHSL(detail * 0.025, detail * 0.04, detail * 0.035);
-    const material = new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.84,
-      metalness: 0.02,
-      emissive: 0x000000,
-      emissiveIntensity: 0,
-      flatShading: true,
+      const edgeGeometry = new THREE.EdgesGeometry(geometry, 20);
+      const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xbfd1a5, transparent: true, opacity: 0.085 });
+      mesh.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
     });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.position.set(x, height / 2 - 0.62, z);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    
-    // Store student data in userData for UI representation
-    mesh.userData = { 
-      q, r, height, 
-      student,
-      baseColor: color.clone() 
-    };
-    
-    world.add(mesh);
-    tiles.push(mesh);
+  });
 
-    const edgeGeometry = new THREE.EdgesGeometry(geometry, 20);
-    const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xbfd1a5, transparent: true, opacity: 0.085 });
-    const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-    mesh.add(edges);
+  const emptyCellPositions = [];
+  for (let q = -WORLD_RADIUS; q <= WORLD_RADIUS; q += 1) {
+    const minR = Math.max(-WORLD_RADIUS, -q - WORLD_RADIUS);
+    const maxR = Math.min(WORLD_RADIUS, -q + WORLD_RADIUS);
+    for (let r = minR; r <= maxR; r += 1) {
+      if (!occupiedCells.has(`${q},${r}`)) emptyCellPositions.push({ q, r });
+    }
   }
 
-  // Generate empty cells
-  const EMPTY_RADIUS = 20; // Enough to look infinite with fog
-  for (let i = 0; i < EMPTY_RADIUS * EMPTY_RADIUS * 3; i++) {
-    const { q, r } = spiral.next().value;
-    
+  const emptyGeometry = new THREE.CylinderGeometry(HEX_SIZE * 0.965, HEX_SIZE * 0.965, 0.04, 6);
+  const emptyMaterial = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+  });
+  const emptyEdgeGeometry = new THREE.EdgesGeometry(emptyGeometry, 20);
+  const emptyEdgeMaterials = {
+    base: new THREE.LineBasicMaterial({ color: 0x4fa98c, transparent: true, opacity: 0.2 }),
+    hover: new THREE.LineBasicMaterial({ color: 0x8ecf8a, transparent: true, opacity: 0.65 }),
+    selected: new THREE.LineBasicMaterial({ color: 0xb7df70, transparent: true, opacity: 0.9 }),
+  };
+
+  emptyCellPositions.forEach(({ q, r }) => {
     const x = HEX_SIZE * Math.sqrt(3) * (q + r / 2);
     const z = HEX_SIZE * 1.5 * r;
-    const height = 0.2; // flat empty cells
-    const depth = height + 1.4;
-    
-    const geometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, depth, 6, 1, false);
-    
-    // Invisible mesh for raycasting
-    const material = new THREE.MeshBasicMaterial({
-      color: 0x000000,
-      transparent: true,
-      opacity: 0,
-      depthWrite: false
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.position.set(x, height / 2 - 0.62, z);
-    
-    mesh.userData = { 
-      q, r, height, 
+    const mesh = new THREE.Mesh(emptyGeometry, emptyMaterial);
+    mesh.position.set(x, WATER_LEVEL + 0.015, z);
+    mesh.userData = {
+      q,
+      r,
       isEmpty: true,
-      baseColor: new THREE.Color(0x000000)
+      edgeMaterials: emptyEdgeMaterials,
     };
-    
+
+    mesh.add(new THREE.LineSegments(emptyEdgeGeometry, emptyEdgeMaterials.base));
     world.add(mesh);
     tiles.push(mesh);
-    
-    const edgeGeometry = new THREE.EdgesGeometry(geometry, 20);
-    const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x4fa98c, transparent: true, opacity: 0.15 });
-    const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-    mesh.add(edges);
-  }
+  });
+
   const waterGeometry = new THREE.PlaneGeometry(10000, 10000);
   const waterMaterial = new THREE.MeshPhysicalMaterial({
     color: 0x143f3d,

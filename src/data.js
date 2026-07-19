@@ -13,13 +13,14 @@ export function generateSchoolData() {
 
   classes.forEach((cls, classIndex) => {
     for (let i = 0; i < cls.studentCount; i++) {
+      const mark = 40 + ((studentId * 37 + classIndex * 17) % 61);
+
       students.push({
         id: studentId++,
         name: `Student ${i + 1}`,
         className: cls.name,
         classIndex: classIndex,
-        // Optional: generate some fake grades or stats for visual variety
-        grade: 50 + Math.random() * 50, 
+        mark,
       });
     }
   });

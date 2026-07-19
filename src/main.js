@@ -78,7 +78,7 @@ const { tiles, water, waterRings } = drawIsland(world, students);
 let hoveredTile = null;
 let selectedTile = null;
 
-tileCount.textContent = `${tiles.length} УЧЕНИКОВ`;
+tileCount.textContent = `${students.length} УЧЕНИКОВ`;
 
 const particlesGeometry = new THREE.BufferGeometry();
 const particlePositions = [];
@@ -106,16 +106,15 @@ function setTileState(tile) {
   
   if (tile.userData.isEmpty) {
     const edges = tile.children[0];
-    if (edges && edges.material) {
-      edges.material.opacity = isSelected ? 0.8 : isHovered ? 0.5 : 0.15;
-      edges.material.color.setHex(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x4fa98c);
-    }
-  } else {
-    tile.material.color.copy(tile.userData.baseColor);
-    tile.material.emissive.set(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x000000);
-    tile.material.emissiveIntensity = isSelected ? 0.43 : isHovered ? 0.24 : 0;
-    tile.scale.setScalar(isSelected ? 1.035 : isHovered ? 1.018 : 1);
+    const { edgeMaterials } = tile.userData;
+    edges.material = isSelected ? edgeMaterials.selected : isHovered ? edgeMaterials.hover : edgeMaterials.base;
+    return;
   }
+
+  tile.material.color.copy(tile.userData.baseColor);
+  tile.material.emissive.set(isSelected ? 0xb7df70 : isHovered ? 0x8ecf8a : 0x000000);
+  tile.material.emissiveIntensity = isSelected ? 0.43 : isHovered ? 0.24 : 0;
+  tile.scale.setScalar(isSelected ? 1.035 : isHovered ? 1.018 : 1);
 }
 
 function updateHover() {
@@ -144,13 +143,13 @@ function selectTile(tile) {
 
   const { q, r, student, isEmpty } = selectedTile.userData;
   selectionCard.classList.add('is-active');
-  
+
   if (isEmpty) {
     selectionName.textContent = 'Свободное место';
     selectionMeta.textContent = `Координаты: [${q}; ${r}]`;
   } else {
     selectionName.textContent = student.name;
-    selectionMeta.textContent = `Класс: ${student.className} · [${q}; ${r}]`;
+    selectionMeta.textContent = `Класс: ${student.className} · Оценка: ${student.mark} · [${q}; ${r}]`;
   }
 }
 
