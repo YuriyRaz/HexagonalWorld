@@ -1,12 +1,17 @@
-export function generateSchoolData() {
-  const classes = [
-    { name: '10A Math', studentCount: 15 },
-    { name: '10B Physics', studentCount: 14 },
-    { name: '11A Chemistry', studentCount: 18 },
-    { name: '11B Biology', studentCount: 12 },
-    { name: '12A Literature', studentCount: 16 },
-    { name: '12B History', studentCount: 11 },
-  ];
+const classNames = [
+  '10A Math',
+  '10B Physics',
+  '11A Chemistry',
+  '11B Biology',
+  '12A Literature',
+  '12B History',
+];
+
+export function generateSchoolData({ classCount = 6, minStudents = 11, maxStudents = 18 } = {}) {
+  const classes = Array.from({ length: classCount }, (_, index) => ({
+    name: classNames[index] ?? `Class ${index + 1}`,
+    studentCount: Math.floor(Math.random() * (maxStudents - minStudents + 1)) + minStudents,
+  }));
 
   const students = [];
   let studentId = 1;

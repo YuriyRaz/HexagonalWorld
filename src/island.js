@@ -2,19 +2,10 @@ import * as THREE from 'three';
 
 const HEX_SIZE = 1.14;
 const WATER_LEVEL = 0.12;
-const ISLAND_DISTANCE = 7;
 const WORLD_RADIUS = 11;
+const CLASS_DISTANCE = 6;
 const MIN_TILE_HEIGHT = 0.55;
 const MAX_TILE_HEIGHT = 6.2;
-
-const islandDirections = [
-  { q: 0, r: -1 },
-  { q: 1, r: -1 },
-  { q: 1, r: 0 },
-  { q: 0, r: 1 },
-  { q: -1, r: 1 },
-  { q: -1, r: 0 },
-];
 
 const palette = [
   new THREE.Color(0xa4a878), // Class 0
@@ -38,35 +29,80 @@ function smoothNoise(q, r) {
   ) * 0.11;
 }
 
-function* getHexSpiral() {
-  yield { q: 0, r: 0 };
-  let radius = 1;
+function getHexRing(radius) {
+  const cells = [];
   const walkDirs = [
     {q: 1, r: 0}, {q: 1, r: -1}, {q: 0, r: -1},
     {q: -1, r: 0}, {q: -1, r: 1}, {q: 0, r: 1}
   ];
-  while (true) {
-    let hex = { q: -radius, r: radius };
-    for (let i = 0; i < 6; i++) {
-      for (let j = 0; j < radius; j++) {
-        yield { q: hex.q, r: hex.r };
-        hex.q += walkDirs[i].q;
-        hex.r += walkDirs[i].r;
-      }
+  let hex = { q: -radius, r: radius };
+
+  for (let i = 0; i < 6; i++) {
+    for (let j = 0; j < radius; j++) {
+      cells.push({ q: hex.q, r: hex.r });
+      hex.q += walkDirs[i].q;
+      hex.r += walkDirs[i].r;
     }
+  }
+
+  return cells;
+}
+
+function* getHexSpiral() {
+  yield { q: 0, r: 0 };
+  let radius = 1;
+  while (true) {
+    yield* getHexRing(radius);
     radius++;
   }
+}
+
+function getDistributedClassCells(classCount) {
+  const cells = [{ q: 0, r: 0 }];
+  let remaining = classCount - 1;
+  let radius = 1;
+
+  while (remaining > 0) {
+    const ring = getHexRing(radius);
+    const cellsOnRing = Math.min(remaining, ring.length);
+
+    for (let i = 0; i < cellsOnRing; i += 1) {
+      cells.push(ring[Math.floor(i * ring.length / cellsOnRing)]);
+    }
+
+    remaining -= cellsOnRing;
+    radius += 1;
+  }
+
+  return cells;
 }
 
 export function drawIsland(world, students) {
   const tiles = [];
   const occupiedCells = new Set();
   const classes = Map.groupBy(students, (student) => student.classIndex);
+  const classCells = getDistributedClassCells(classes.size);
+  const tileGeometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, 1, 6, 1, false);
+  const tileMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.84,
+    metalness: 0.02,
+    flatShading: true,
+  });
+  const occupiedTiles = new THREE.InstancedMesh(tileGeometry, tileMaterial, students.length);
+  const instances = new Array(students.length);
+  const baseColors = new Float32Array(students.length * 3);
+  const matrix = new THREE.Matrix4();
+  const position = new THREE.Vector3();
+  const scale = new THREE.Vector3();
+  const rotation = new THREE.Quaternion();
+  let instanceIndex = 0;
+  let worldSize = 18;
 
-  [...classes.values()].forEach((classStudents, islandIndex) => {
-    const direction = islandDirections[islandIndex % islandDirections.length];
-    const islandQ = direction.q * ISLAND_DISTANCE;
-    const islandR = direction.r * ISLAND_DISTANCE;
+  [...classes.values()].forEach((classStudents, classIndex) => {
+    const classCell = classCells[classIndex];
+    const islandQ = classCell.q * CLASS_DISTANCE;
+    const islandR = classCell.r * CLASS_DISTANCE;
     const spiral = getHexSpiral();
 
     classStudents.forEach((student) => {
@@ -80,37 +116,39 @@ export function drawIsland(world, students) {
       const x = HEX_SIZE * Math.sqrt(3) * (q + r / 2);
       const z = HEX_SIZE * 1.5 * r;
       const depth = height + 1.4;
-      const geometry = new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, depth, 6, 1, false);
       const color = baseColor.clone().offsetHSL(detail * 0.025, detail * 0.04, detail * 0.035);
-      const material = new THREE.MeshStandardMaterial({
-        color,
-        roughness: 0.84,
-        metalness: 0.02,
-        emissive: 0x000000,
-        emissiveIntensity: 0,
-        flatShading: true,
-      });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.set(x, height / 2 - 0.62, z);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      mesh.userData = {
+      const y = height / 2 - 0.62;
+
+      position.set(x, y, z);
+      scale.set(1, depth, 1);
+      matrix.compose(position, rotation, scale);
+      occupiedTiles.setMatrixAt(instanceIndex, matrix);
+      occupiedTiles.setColorAt(instanceIndex, color);
+      color.toArray(baseColors, instanceIndex * 3);
+      instances[instanceIndex] = {
         q,
         r,
+        x,
+        y,
+        z,
+        depth,
         height,
         student,
-        baseColor: color.clone(),
       };
-
-      world.add(mesh);
-      tiles.push(mesh);
+      instanceIndex += 1;
       occupiedCells.add(`${q},${r}`);
-
-      const edgeGeometry = new THREE.EdgesGeometry(geometry, 20);
-      const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xbfd1a5, transparent: true, opacity: 0.085 });
-      mesh.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+      worldSize = Math.max(worldSize, Math.hypot(x, z) + HEX_SIZE * 2);
     });
   });
+
+  occupiedTiles.castShadow = students.length <= 2500;
+  occupiedTiles.receiveShadow = true;
+  occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  occupiedTiles.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  occupiedTiles.userData = { instances, baseColors };
+  occupiedTiles.computeBoundingSphere();
+  world.add(occupiedTiles);
+  tiles.push(occupiedTiles);
 
   const emptyCellPositions = [];
   for (let q = -WORLD_RADIUS; q <= WORLD_RADIUS; q += 1) {
@@ -128,11 +166,20 @@ export function drawIsland(world, students) {
     opacity: 0,
     depthWrite: false,
   });
-  const emptyEdgeGeometry = new THREE.EdgesGeometry(emptyGeometry, 20);
+  const emptyEdgePoints = [];
+  for (let i = 0; i < 6; i += 1) {
+    const angle = i / 6 * Math.PI * 2;
+    emptyEdgePoints.push(new THREE.Vector3(
+      Math.sin(angle) * HEX_SIZE * 0.965,
+      0.021,
+      Math.cos(angle) * HEX_SIZE * 0.965
+    ));
+  }
+  const emptyEdgeGeometry = new THREE.BufferGeometry().setFromPoints(emptyEdgePoints);
   const emptyEdgeMaterials = {
-    base: new THREE.LineBasicMaterial({ color: 0x4fa98c, transparent: true, opacity: 0.2 }),
-    hover: new THREE.LineBasicMaterial({ color: 0x8ecf8a, transparent: true, opacity: 0.65 }),
-    selected: new THREE.LineBasicMaterial({ color: 0xb7df70, transparent: true, opacity: 0.9 }),
+    base: new THREE.LineBasicMaterial({ color: 0x4fa98c, transparent: true, opacity: 0.2, depthWrite: false }),
+    hover: new THREE.LineBasicMaterial({ color: 0x8ecf8a, transparent: true, opacity: 0.65, depthWrite: false }),
+    selected: new THREE.LineBasicMaterial({ color: 0xb7df70, transparent: true, opacity: 0.9, depthWrite: false }),
   };
 
   emptyCellPositions.forEach(({ q, r }) => {
@@ -147,7 +194,9 @@ export function drawIsland(world, students) {
       edgeMaterials: emptyEdgeMaterials,
     };
 
-    mesh.add(new THREE.LineSegments(emptyEdgeGeometry, emptyEdgeMaterials.base));
+    const edges = new THREE.LineLoop(emptyEdgeGeometry, emptyEdgeMaterials.base);
+    edges.renderOrder = 2;
+    mesh.add(edges);
     world.add(mesh);
     tiles.push(mesh);
   });
@@ -170,7 +219,16 @@ export function drawIsland(world, students) {
   water.receiveShadow = true;
   world.add(water);
 
-  const ringMaterial = new THREE.MeshBasicMaterial({ color: 0x77b1a0, transparent: true, opacity: 0.065, side: THREE.DoubleSide });
+  const ringMaterial = new THREE.MeshBasicMaterial({
+    color: 0x77b1a0,
+    transparent: true,
+    opacity: 0.065,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
   const waterRings = [];
   for (let i = 0; i < 7; i += 1) {
     const ring = new THREE.Mesh(new THREE.RingGeometry(12.8 + i * 2.8, 12.84 + i * 2.8, 96), ringMaterial.clone());
@@ -184,11 +242,20 @@ export function drawIsland(world, students) {
 
   const groundGlow = new THREE.Mesh(
     new THREE.CircleGeometry(25, 72),
-    new THREE.MeshBasicMaterial({ color: 0x3e9a79, transparent: true, opacity: 0.05, blending: THREE.AdditiveBlending, depthWrite: false })
+    new THREE.MeshBasicMaterial({
+      color: 0x3e9a79,
+      transparent: true,
+      opacity: 0.05,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    })
   );
   groundGlow.rotation.x = -Math.PI / 2;
   groundGlow.position.y = WATER_LEVEL + 0.02;
   world.add(groundGlow);
 
-  return { tiles, water, waterRings };
+  return { tiles, water, waterRings, worldSize };
 }

@@ -54,6 +54,30 @@
           </div>
         </div>
 
+        <form class="generator-form" id="generator-form">
+          <div class="generator-form__heading">
+            <span>ПАРАМЕТРЫ МИРА</span>
+            <small>СОЗДАТЬ ЗАНОВО</small>
+          </div>
+          <label class="form-field form-field--wide">
+            <span>КОЛИЧЕСТВО КЛАССОВ</span>
+            <input id="class-count" name="classCount" type="number" min="1" max="1000" value="6" required />
+          </label>
+          <label class="form-field">
+            <span>МИН. УЧЕНИКОВ</span>
+            <input id="min-students" name="minStudents" type="number" min="1" max="19" value="11" required />
+          </label>
+          <label class="form-field">
+            <span>МАКС. УЧЕНИКОВ</span>
+            <input id="max-students" name="maxStudents" type="number" min="1" max="19" value="18" required />
+          </label>
+          <p class="form-error" id="form-error" aria-live="polite"></p>
+          <button class="generate-button" type="submit">
+            <span>ПЕРЕСОЗДАТЬ КЛАССЫ</span>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
+          </button>
+        </form>
+
         <div class="selection" id="selection-card">
           <div class="selection__icon">
             <svg viewBox="0 0 32 32" aria-hidden="true"><path d="m16 3 11 6.5v13L16 29 5 22.5v-13L16 3Z" /></svg>
