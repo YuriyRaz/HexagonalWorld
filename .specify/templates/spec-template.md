@@ -98,6 +98,20 @@
 - **FR-006**: System MUST authenticate users via [NEEDS CLARIFICATION: auth method not specified - email/password, SSO, OAuth?]
 - **FR-007**: System MUST retain user data for [NEEDS CLARIFICATION: retention period not specified]
 
+### Quality and Constraint Requirements *(mandatory)*
+
+<!--
+  Define measurable requirements for every applicable category below. Remove a category only when it
+  cannot affect this feature, and record the reason in Assumptions. Keep requirements focused on user
+  or product outcomes rather than implementation choices.
+-->
+
+- **QR-001 - Domain neutrality**: [Define stable identity, hierarchy, and domain-independence outcomes]
+- **QR-002 - Determinism**: [Define which identical inputs must produce reproducible user-visible results]
+- **QR-003 - Performance and scale**: [Define representative dataset size and measurable responsiveness]
+- **QR-004 - Accessibility and responsive use**: [Define keyboard, touch, viewport, and motion outcomes]
+- **QR-005 - Resilience**: [Define loading, empty, invalid, unsupported, and failure behavior as applicable]
+
 ### Key Entities *(include if feature involves data)*
 
 - **[Entity 1]**: [What it represents, key attributes without implementation]
@@ -116,6 +130,7 @@
 - **SC-002**: [Measurable metric, e.g., "System handles 1000 concurrent users without degradation"]
 - **SC-003**: [User satisfaction metric, e.g., "90% of users successfully complete primary task on first attempt"]
 - **SC-004**: [Business metric, e.g., "Reduce support tickets related to [X] by 50%"]
+- **SC-005**: [Quality validation outcome tied to the applicable QR requirements]
 
 ## Assumptions
 

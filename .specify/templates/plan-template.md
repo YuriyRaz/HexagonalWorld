@@ -4,7 +4,7 @@
 
 **Input**: Feature specification from `/specs/[###-feature-name]/spec.md`
 
-**Note**: This template is filled in by the `/speckit.plan` command; its definition describes the execution workflow.
+**Note**: This template is filled in by the `/speckit-plan` command; its definition describes the execution workflow.
 
 ## Summary
 
@@ -36,11 +36,27 @@
 
 **Scale/Scope**: [domain-specific, e.g., 10k users, 1M LOC, 50 screens or NEEDS CLARIFICATION]
 
+**Accessibility/Responsive Scope**: [keyboard, touch, viewport, reduced-motion, and assistive behavior]
+
+**Deterministic Inputs/Outputs**: [normalized inputs, configuration, intentional randomness, reproducibility]
+
+**Resource Ownership**: [GPU resources, event listeners, replacement/disposal lifecycle]
+
 ## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+- **Domain-neutral model**: Stable IDs and explicit parent-child relationships are preserved; source
+  domain assumptions remain behind adapters.
+- **Separation and determinism**: Data, layout, rendering, and UI boundaries are explicit; identical
+  normalized inputs and configuration produce reproducible visual mappings.
+- **Performance and lifecycle**: Representative scale and measurable performance goals are stated;
+  per-frame allocation is avoided and GPU/listener ownership and cleanup are defined.
+- **Accessibility and resilience**: Keyboard or accessible alternatives, mobile behavior,
+  reduced-motion behavior, and applicable loading/empty/error/unsupported states are specified.
+- **Quality and simplicity**: The design is the smallest justified solution; dependencies and
+  abstractions have concrete need; validation includes `npm run build` plus risk-appropriate automated
+  or browser-level checks.
 
 ## Project Structure
 
@@ -48,12 +64,12 @@
 
 ```text
 specs/[###-feature]/
-├── plan.md              # This file (/speckit.plan command output)
-├── research.md          # Phase 0 output (/speckit.plan command)
-├── data-model.md        # Phase 1 output (/speckit.plan command)
-├── quickstart.md        # Phase 1 output (/speckit.plan command)
-├── contracts/           # Phase 1 output (/speckit.plan command)
-└── tasks.md             # Phase 2 output (/speckit.tasks command - NOT created by /speckit.plan)
+├── plan.md              # This file (/speckit-plan command output)
+├── research.md          # Phase 0 output (/speckit-plan command)
+├── data-model.md        # Phase 1 output (/speckit-plan command)
+├── quickstart.md        # Phase 1 output (/speckit-plan command)
+├── contracts/           # Phase 1 output (/speckit-plan command)
+└── tasks.md             # Phase 2 output (/speckit-tasks command - NOT created by /speckit-plan)
 ```
 
 ### Source Code (repository root)
