@@ -4,8 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#071310" />
-    <meta name="description" content="Интерактивный трехмерный мир из гексагональных плиток" />
-    <title>Hexaterra | Гексагональный остров</title>
+    <meta name="description" content="Сравнение алгоритмов иерархического размещения на гексагональной сетке" />
+    <title>Hexaterra | Иерархическая раскладка</title>
   </head>
   <body>
     <main id="app">
@@ -40,17 +40,25 @@
 
       <aside class="info-panel" id="info-panel">
         <div class="eyebrow"><span></span> КАРТОГРАФИЯ / 01</div>
-        <h1>Остров<br /><em>Эйра</em></h1>
-        <p class="lead">Каждый остров представляет отдельный класс, а высота ячейки показывает оценку ученика.</p>
+        <h1>Карта<br /><em>школ</em></h1>
+        <p class="lead">Сравните способы размещения одних и тех же школ, классов и учеников на гексагональной сетке.</p>
 
-        <div class="coordinates">
+        <div class="layout-stats" aria-label="Статистика раскладки">
           <div>
-            <span>ШИРОТА</span>
-            <strong>61.5240° N</strong>
+            <span>ШКОЛ</span>
+            <strong id="school-total">3</strong>
           </div>
           <div>
-            <span>ДОЛГОТА</span>
-            <strong>18.7342° E</strong>
+            <span>КЛАССОВ</span>
+            <strong id="class-total">12</strong>
+          </div>
+          <div>
+            <span>ЗАЗОР КЛАССОВ</span>
+            <strong id="class-gap">1.0 ГЕКСА</strong>
+          </div>
+          <div>
+            <span>ЗАЗОР ШКОЛ</span>
+            <strong id="school-gap">2.0 ГЕКСА</strong>
           </div>
         </div>
 
@@ -59,21 +67,34 @@
             <span>ПАРАМЕТРЫ МИРА</span>
             <small>СОЗДАТЬ ЗАНОВО</small>
           </div>
-          <label class="form-field form-field--wide">
+          <label class="form-field">
+            <span>КОЛИЧЕСТВО ШКОЛ</span>
+            <input id="school-count" name="schoolCount" type="number" min="1" max="10" value="3" required />
+          </label>
+          <label class="form-field">
             <span>КОЛИЧЕСТВО КЛАССОВ</span>
-            <input id="class-count" name="classCount" type="number" min="1" max="1000" value="6" required />
+            <input id="class-count" name="classCount" type="number" min="1" max="80" value="12" required />
           </label>
           <label class="form-field">
             <span>МИН. УЧЕНИКОВ</span>
-            <input id="min-students" name="minStudents" type="number" min="1" max="19" value="11" required />
+            <input id="min-students" name="minStudents" type="number" min="1" max="60" value="11" required />
           </label>
           <label class="form-field">
             <span>МАКС. УЧЕНИКОВ</span>
-            <input id="max-students" name="maxStudents" type="number" min="1" max="19" value="18" required />
+            <input id="max-students" name="maxStudents" type="number" min="1" max="60" value="18" required />
           </label>
+          <label class="form-field form-field--wide">
+            <span>АЛГОРИТМ РАСКЛАДКИ</span>
+            <select id="layout-algorithm" name="algorithm">
+              <option value="packed" selected>Иерархическая упаковка</option>
+              <option value="nested">Вложенные кольца</option>
+              <option value="flat">Плоские кольца</option>
+            </select>
+          </label>
+          <p class="algorithm-note" id="algorithm-note"></p>
           <p class="form-error" id="form-error" aria-live="polite"></p>
           <button class="generate-button" type="submit">
-            <span>ПЕРЕСОЗДАТЬ КЛАССЫ</span>
+            <span>СГЕНЕРИРОВАТЬ ДАННЫЕ</span>
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 6l4 4-4 4" /></svg>
           </button>
         </form>

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { generateSchoolData } from './data.js';
 import { drawIsland } from './island.js';
+import { layoutAlgorithms } from './layout.js';
 import './style.css';
 
 const canvas = document.querySelector('#world');
@@ -12,8 +13,16 @@ const selectionMeta = document.querySelector('#selection-meta');
 const tileCount = document.querySelector('#tile-count');
 const compassDial = document.querySelector('#compass-dial');
 const generatorForm = document.querySelector('#generator-form');
+const schoolCountInput = document.querySelector('#school-count');
+const classCountInput = document.querySelector('#class-count');
 const minStudentsInput = document.querySelector('#min-students');
 const maxStudentsInput = document.querySelector('#max-students');
+const algorithmSelect = document.querySelector('#layout-algorithm');
+const algorithmNote = document.querySelector('#algorithm-note');
+const schoolTotal = document.querySelector('#school-total');
+const classTotal = document.querySelector('#class-total');
+const classGap = document.querySelector('#class-gap');
+const schoolGap = document.querySelector('#school-gap');
 const formError = document.querySelector('#form-error');
 
 const scene = new THREE.Scene();
@@ -100,10 +109,11 @@ function fitWorldView(worldSize) {
   sun.shadow.camera.updateProjectionMatrix();
 }
 
-let students = generateSchoolData();
+let schoolData = generateSchoolData();
+let algorithm = algorithmSelect.value;
 let islandRoot = new THREE.Group();
 world.add(islandRoot);
-let { tiles, water, waterRings, worldSize } = drawIsland(islandRoot, students);
+let { tiles, water, waterRings, worldSize, stats } = drawIsland(islandRoot, schoolData, algorithm);
 fitWorldView(worldSize);
 
 let hoveredTile = null;
@@ -114,7 +124,20 @@ controls.addEventListener('change', () => {
   interactionDirty = true;
 });
 
-tileCount.textContent = `${students.length} УЧЕНИКОВ`;
+function formatGap(value) {
+  return value === null ? '—' : `${value.toFixed(1)} ГЕКСА`;
+}
+
+function updateWorldSummary() {
+  tileCount.textContent = `${schoolData.students.length} УЧЕНИКОВ`;
+  schoolTotal.textContent = schoolData.schools.length;
+  classTotal.textContent = schoolData.classes.length;
+  classGap.textContent = formatGap(stats.classGap);
+  schoolGap.textContent = formatGap(stats.schoolGap);
+  algorithmNote.textContent = layoutAlgorithms[algorithm].note;
+}
+
+updateWorldSummary();
 
 function disposeIsland(root) {
   const geometries = new Set();
@@ -141,9 +164,21 @@ function clearSelection() {
   interactionDirty = true;
 }
 
+function rebuildIsland() {
+  clearSelection();
+  world.remove(islandRoot);
+  disposeIsland(islandRoot);
+  islandRoot = new THREE.Group();
+  world.add(islandRoot);
+  ({ tiles, water, waterRings, worldSize, stats } = drawIsland(islandRoot, schoolData, algorithm));
+  fitWorldView(worldSize);
+  updateWorldSummary();
+}
+
 generatorForm.addEventListener('submit', (event) => {
   event.preventDefault();
   formError.textContent = '';
+  schoolCountInput.setCustomValidity('');
   maxStudentsInput.setCustomValidity('');
 
   if (!generatorForm.checkValidity()) {
@@ -152,6 +187,7 @@ generatorForm.addEventListener('submit', (event) => {
   }
 
   const formData = new FormData(generatorForm);
+  const schoolCount = Number(formData.get('schoolCount'));
   const classCount = Number(formData.get('classCount'));
   const minStudents = Number(formData.get('minStudents'));
   const maxStudents = Number(formData.get('maxStudents'));
@@ -164,23 +200,29 @@ generatorForm.addEventListener('submit', (event) => {
     return;
   }
 
-  clearSelection();
-  world.remove(islandRoot);
-  disposeIsland(islandRoot);
+  if (schoolCount > classCount) {
+    const message = 'Школ не может быть больше, чем классов.';
+    schoolCountInput.setCustomValidity(message);
+    formError.textContent = message;
+    schoolCountInput.reportValidity();
+    return;
+  }
 
-  students = generateSchoolData({ classCount, minStudents, maxStudents });
-  islandRoot = new THREE.Group();
-  world.add(islandRoot);
-  ({ tiles, water, waterRings, worldSize } = drawIsland(islandRoot, students));
-  fitWorldView(worldSize);
-  tileCount.textContent = `${students.length} УЧЕНИКОВ`;
+  schoolData = generateSchoolData({ schoolCount, classCount, minStudents, maxStudents });
+  rebuildIsland();
 });
 
-[minStudentsInput, maxStudentsInput].forEach((input) => {
+[schoolCountInput, classCountInput, minStudentsInput, maxStudentsInput].forEach((input) => {
   input.addEventListener('input', () => {
+    schoolCountInput.setCustomValidity('');
     maxStudentsInput.setCustomValidity('');
     formError.textContent = '';
   });
+});
+
+algorithmSelect.addEventListener('change', () => {
+  algorithm = algorithmSelect.value;
+  rebuildIsland();
 });
 
 const particlesGeometry = new THREE.BufferGeometry();
@@ -220,9 +262,11 @@ function setTileState(tile) {
   const { object, instanceId } = tile;
 
   if (object.userData.isEmpty) {
-    const edges = object.children[0];
-    const { edgeMaterials } = object.userData;
-    edges.material = isSelected ? edgeMaterials.selected : isHovered ? edgeMaterials.hover : edgeMaterials.base;
+    tileColor.fromArray(object.userData.baseColors, instanceId * 3);
+    if (isSelected) tileColor.lerp(selectedColor, 0.78);
+    else if (isHovered) tileColor.lerp(hoverColor, 0.58);
+    object.setColorAt(instanceId, tileColor);
+    object.instanceColor.needsUpdate = true;
     return;
   }
 
@@ -272,7 +316,7 @@ function selectTile(tile) {
   }
 
   const { object, instanceId } = selectedTile;
-  const data = object.userData.isEmpty ? object.userData : object.userData.instances[instanceId];
+  const data = object.userData.instances[instanceId];
   const { q, r, student, isEmpty } = data;
   selectionCard.classList.add('is-active');
 
@@ -281,7 +325,7 @@ function selectTile(tile) {
     selectionMeta.textContent = `Координаты: [${q}; ${r}]`;
   } else {
     selectionName.textContent = student.name;
-    selectionMeta.textContent = `Класс: ${student.className} · Оценка: ${student.mark} · [${q}; ${r}]`;
+    selectionMeta.textContent = `${student.schoolName} · ${student.className} · Оценка: ${student.mark} · [${q}; ${r}]`;
   }
 }
 
@@ -338,6 +382,7 @@ function onResize() {
 addEventListener('resize', onResize);
 
 const clock = new THREE.Clock();
+const cameraDirection = new THREE.Vector3();
 function animate(time) {
   requestAnimationFrame(animate);
   const elapsed = clock.getElapsedTime();
@@ -350,9 +395,8 @@ function animate(time) {
   });
   particles.rotation.y = elapsed * 0.006;
 
-  const direction = new THREE.Vector3();
-  camera.getWorldDirection(direction);
-  const heading = Math.atan2(direction.x, direction.z) * 180 / Math.PI;
+  camera.getWorldDirection(cameraDirection);
+  const heading = Math.atan2(cameraDirection.x, cameraDirection.z) * 180 / Math.PI;
   compassDial.style.transform = `rotate(${-heading}deg)`;
 
   renderer.render(scene, camera);
