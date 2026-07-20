@@ -8,7 +8,9 @@ cancelActiveLayout(reason = 'superseded') -> void
 dispose() -> void
 ```
 
-Every call receives a page-assigned monotonically increasing `requestId`. Existing modes resolve through the same promise API without a worker. Force modes use a fresh Vite module worker.
+The runner is created with `{ workerFactory, hangGuardMs }`. Production fixes `hangGuardMs` at `60000`; timeout tests dependency-inject exactly `50`. This runner-only value never enters `LayoutConfig` or the worker request and cannot affect successful layout output.
+
+Every call receives a page-assigned monotonically increasing `requestId`. Existing modes resolve through the same promise API without a worker. The force-directed mode uses a fresh Vite module worker.
 
 Promise outcomes:
 
@@ -26,7 +28,7 @@ Messages are structured-cloneable plain objects. Visual payloads, localized stri
 ```js
 {
   type: 'calculate',
-  request: LayoutRequest // mode is force-anchors or force-groups
+  request: LayoutRequest // mode is force-anchors
 }
 ```
 
@@ -42,7 +44,7 @@ The worker accepts one calculate request in its lifetime. Replacement is the can
 }
 ```
 
-The worker verifies `requestId === result.requestId`. The runner revalidates ID, mode, cardinality, unique cells, radius, finite values, ordering, and spring invariants before resolving.
+The worker verifies `requestId === result.requestId`. The runner revalidates ID, mode, cardinality, unique cells, integer radius no greater than 256, finite values, deterministic ordering, at most 5,999 springs, and the exact leaf/anchor immediate-parent spring chain before resolving. A missing or extra force-mode spring fails validation; excess spring count or radius is rejected without replacing the current world.
 
 ### Failure Response
 
@@ -77,16 +79,16 @@ Unexpected exceptions are caught at the worker boundary and serialized as `INTER
 
 | Code | Trigger | `silent` | Required behavior |
 |---|---|---:|---|
-| `UNSUPPORTED_ENVIRONMENT` | Module workers unavailable or prohibited before creation | false | Reject immediately; retain world |
+| `UNSUPPORTED_ENVIRONMENT` | Module workers unavailable or prohibited during preflight | false | Reject immediately; retain world |
 | `WORKER_START_FAILED` | Worker constructor/startup error | false | Reject; retain world |
 | `WORKER_MESSAGE_FAILED` | `error`, `messageerror`, malformed response, or result revalidation failure | false | Terminate worker; retain world |
-| `TIMEOUT` | Independently configured stuck-worker safety guard expires | false | Terminate worker; retain world |
+| `TIMEOUT` | 60,000 ms production stuck-worker guard, or injected 50 ms test guard, expires | false | Remove listeners, clear timer, terminate worker exactly once; retain world |
 | `CANCELLED` | New request or app teardown | true | Reject old promise, terminate worker |
 | `INTERNAL_ERROR` | Unexpected runner failure | false | Clean up and retain world |
 
-Rendering adds `WEBGL_UNAVAILABLE` or `RENDER_FAILED` after a valid layout result; those errors use the same `LayoutOperationError` shape but do not originate in the worker.
+Before starting a worker, orchestration also preflights WebGL 2. Rendering/orchestration adds `WEBGL_UNAVAILABLE` when the required context cannot be created, or `RENDER_FAILED` after a valid layout result; those errors use the same `LayoutOperationError` shape but do not originate in the worker.
 
-The safety guard is not equal to and is not derived from the 2-second or 8-second benchmark thresholds. Those thresholds are nearest-rank acceptance statistics across ten measured builds and never abort an individual user run.
+The safety guard is not equal to and is not derived from the performance thresholds. Measure on the documented Windows 11 reference workstation with Intel Core i7-1360P, 32 GB RAM, AC power, Playwright 1.61 bundled Chromium, 1440x900 viewport, DPR 1, no CPU throttling, and nonessential applications closed. After two warmups, ten measured builds per fixture use nearest-rank p95 (rank 10): full selection-to-commit time is at most 2 seconds for 1,200 towers and 8 seconds for 4,800 towers. For each busy-state response, wait until status is busy while the algorithm selector remains focused, press `Tab` once, and measure `keydown.timeStamp` to the first subsequent `requestAnimationFrame` callback; rank-10 p95 is at most 100 ms. For 4,800 towers, record one five-second post-commit animation-frame-delta window after each measured build, pool the ten windows, and require their median to be at most 33.3 ms. Full time includes worker startup, transport, calculation, validation, visual-resource creation, and commit. These statistics never abort an individual user run.
 
 `main.js` owns a code-to-localized-message table and writes non-silent failures to the existing live region. The worker and pure layout modules never choose locale or UI wording.
 
@@ -95,23 +97,26 @@ The safety guard is not equal to and is not derived from the 2-second or 8-secon
 ```text
 runLayout(N)
   -> reject/terminate active N-1 as silent CANCELLED
-  -> verify worker support
+  -> verify WebGL 2 support or reject WEBGL_UNAVAILABLE
+  -> verify module-worker support or reject UNSUPPORTED_ENVIRONMENT
   -> construct worker N
-  -> start independent hang guard N
+  -> start 60,000 ms production hang guard N (50 ms when injected by timeout tests)
   -> post calculate N
 
 success/failure N
   -> verify N is latest
+  -> revalidate complete response and spring chain
   -> clear hang guard
+  -> remove worker handlers
   -> terminate worker N
-  -> validate and resolve, or reject typed error
+  -> resolve, or reject typed error
 ```
 
 Additional rules:
 
 - Selecting an existing synchronous mode cancels any force worker first.
-- The hang guard covers worker startup, structured clone, calculation, and response validation; elapsed time never determines algorithm output or implements performance acceptance.
+- The 60,000 ms production hang guard, or exactly 50 ms injected timeout-test guard, remains active through worker startup, structured clone, calculation, response receipt, and complete runner revalidation; elapsed time never determines algorithm output or implements performance acceptance.
 - End-to-end performance measurement independently continues through candidate rendering and transactional commit.
-- App teardown rejects the active promise, terminates the worker, and clears timers/listeners.
+- Success, failure, cancellation, startup failure, and app teardown remove worker handlers, clear the guard, and terminate the worker exactly once; `dispose()` is idempotent.
 - The selector remains enabled and operable while a force request is active.
 - An empty hierarchy, unsupported environment, startup failure, worker failure, hang-guard expiry, or render failure leaves the previous committed island active and produces one localized announcement unless silent.

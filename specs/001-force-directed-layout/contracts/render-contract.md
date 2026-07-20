@@ -37,16 +37,16 @@ Source-domain values are converted by the source adapter before this boundary. R
 ```js
 {
   occupiedOpacity: 0.5,
-  showSprings: true,
-  springLevel: 0
+  showSprings: true
 }
 ```
 
 Validation before allocation:
 
 - Every placement has one visual payload and no payload is joined twice.
-- Placement cells are unique integer axial coordinates within supported radius.
-- `springs.length` is zero when `showSprings` is false. Hierarchy-edge cardinality is already validated by layout/runner boundaries; when springs are enabled, rendering creates exactly one segment per supplied validated spring and accepts an empty array.
+- Placement cells are unique integer axial coordinates and `layoutResult.gridRadius` is an integer no greater than 256.
+- `springs.length` is zero when `showSprings` is false. For the force mode, the supplied array exactly matches the validated immediate-parent anchor relations; rendering creates one segment per relation and accepts an empty array only when that expected relation set is empty.
+- Force-mode `springs.length` is no greater than 5,999.
 - All spring endpoints are finite.
 
 ## IslandHandle
@@ -68,7 +68,7 @@ Rules:
 - `root` is built detached and committed transactionally.
 - `interactiveTiles` contains occupied and empty tile meshes only.
 - `stats` preserves the generic depth-indexed layout summary; UI adapters choose localized labels.
-- `dispose()` releases every geometry and material owned by the island exactly once and is idempotent.
+- `dispose()` releases every handle-owned geometry, material, buffer, object, and listener exactly once and is idempotent.
 
 ## Resource Ownership
 
@@ -83,8 +83,7 @@ Rules:
 | Mode | Tower opacity | Tower depth write | Springs |
 |---|---:|---:|---|
 | Existing layouts | 1 | Enabled | None |
-| `force-anchors` | 0.5 | Disabled | One batched `LineSegments` object |
-| `force-groups` | 0.5 | Disabled | None |
+| `force-anchors` | 0.5 | Disabled | One batched `LineSegments` object when active relations exist |
 
 Spring rules:
 
@@ -106,11 +105,14 @@ The browser fixture assigns one control spring and applies, without modifying th
 | Desktop | 1440x900 | 1 | 34 degrees | Control-spring midpoint at `y = 0` | 32 degrees clockwise from +Z | 30 degrees | 43 world units |
 | Mobile | 390x844 | 3 | 34 degrees | Same | 32 degrees clockwise from +Z | 30 degrees | 72 world units |
 
-For each bundled Chromium, Firefox, and WebKit visual project:
+Run these presets in the six focused repeatable projects `visual-{desktop|mobile}-{chromium|firefox|webkit}`. Exercise the equivalent preset in current and previous stable Google Chrome/Blink and Mozilla Firefox/Gecko on applicable desktop and Android phone targets, and Apple Safari/WebKit on macOS and iPhone. Separately, run SC-012 selection/build/spring/restore coverage in all 18 release/device-class combinations, including Android tablet/hybrid for Chrome and Firefox and iPad for Safari, at boundary viewports 1024x720 desktop, 360x800 phone, and 768x1024 tablet/hybrid CSS px. The fixed visual presets do not replace those compatibility viewports.
 
-- Every assigned control-spring segment whose only intervening geometry is a force-mode tower remains distinguishable.
-- A segment behind assigned opaque geometry fails the depth test and is occluded.
-- Existing tower color, height, hover, and selection meanings remain recognizable.
+For each focused visual project:
+
+- The fixture defines paired 5x5 regions in screenshot device pixels after DPR for every visible spring cross-section and adjacent background, plus 5x5 hover, selection, and opaque-occlusion regions.
+- Contrast uses WCAG relative luminance `(L1 + 0.05) / (L2 + 0.05)` after sRGB linearization. Every visible-spring, hover, and selection region contains at least one pixel at 3:1 or greater against its paired reference.
+- Every pixel in an opaque-occlusion region differs from the corresponding pixel in an otherwise identical spring-disabled control frame by no more than 5 in each 8-bit RGB channel.
+- Object-level assertions prove existing tower color and height mappings are unchanged.
 - The user camera state before the fixture is restored after the assertion.
 
 ## Transactional Commit
@@ -123,8 +125,9 @@ validated LayoutResult
   -> stale request: dispose candidate handle
   -> add candidate root
   -> swap active interaction references
+  -> commit failure: restore prior references, remove/dispose candidate, retain prior root
   -> remove previous root
   -> dispose previous handle
 ```
 
-If WebGL is unavailable, report `WEBGL_UNAVAILABLE`. If candidate creation or commit fails, report `RENDER_FAILED`, announce the mapped localized message, and retain the previous root and interaction references.
+If a WebGL 2 context is unavailable, report `WEBGL_UNAVAILABLE`. If candidate creation or commit fails, remove and dispose the candidate, restore or preserve prior interaction references, report `RENDER_FAILED`, announce the mapped localized message, and leave the previous root active and owned by its existing handle.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The feature separates source-domain data, normalized hierarchy, mutable simulation state, layout output, visual payload, and GPU resources. Only normalized leaves receive surface placements. Internal entities may become calculation-only anchors in one mode but never become placements or towers.
+The feature separates source-domain data, normalized hierarchy, mutable simulation state, layout output, visual payload, and GPU resources. Only normalized leaves receive surface placements. In the force-directed mode, applicable internal entities become calculation-only anchors but never become placements or towers.
 
 ## Supported Scale
 
@@ -16,7 +16,7 @@ The feature separates source-domain data, normalized hierarchy, mutable simulati
 | Active hierarchy links / debug springs | 5,999 |
 | Final axial grid radius | 256 |
 
-Exceeding a bound returns `UNSUPPORTED_SCALE` before simulation starts. The current generator remains within 4,800 leaves, 90 internal entities, and two ancestor memberships per leaf.
+Entity, hierarchy, membership, and active-link bounds are validated before simulation and return `UNSUPPORTED_SCALE` when exceeded. Final radius is validated during calculation and again by the runner before publication; radius above 256 returns `UNSUPPORTED_SCALE` without a partial result or world replacement. The current generator remains within 4,800 leaves, 90 internal entities, and two ancestor memberships per leaf.
 
 ## NormalizedEntity
 
@@ -64,12 +64,12 @@ Selectable algorithm metadata.
 
 | Field | Type | Rules |
 |---|---|---|
-| `id` | enum | Existing IDs plus `force-anchors` and `force-groups` |
+| `id` | enum | Existing IDs plus `force-anchors` |
 | `label` | string | Localized selector label |
-| `note` | string | States grouping method, spring presence/absence, and tower transparency |
-| `isAsync` | boolean | True for both force modes |
-| `showSprings` | boolean | True only for `force-anchors` |
-| `occupiedOpacity` | number | `0.5` for force modes; `1` for existing modes |
+| `note` | string | States virtual-anchor grouping, spring visibility, and tower transparency |
+| `isAsync` | boolean | True for `force-anchors`; false for existing modes |
+| `showSprings` | boolean | True for `force-anchors`; false for existing modes |
+| `occupiedOpacity` | number | `0.5` for `force-anchors`; `1` for existing modes |
 
 ## LayoutConfig
 
@@ -94,11 +94,9 @@ Internal versioned force configuration. It is not user-editable.
 | `manyBodyDistanceMin` | finite non-negative number | Explicit minimum interaction distance |
 | `manyBodyDistanceMax` | finite positive number | Explicit maximum interaction distance |
 | `centerStrength` | finite non-negative number | Weak drift prevention |
-| `linkDistance` | finite positive number | Anchor mode only |
-| `linkStrength` | finite non-negative number | Anchor mode only |
+| `linkDistance` | finite positive number | Immediate-parent spring distance |
+| `linkStrength` | finite non-negative number | Immediate-parent spring strength |
 | `linkIterations` | positive integer | Explicit anchor-link relaxation count |
-| `groupStrength` | finite non-negative number | Immediate-ancestor grouping strength |
-| `ancestorDecay` | number | In `[0, 1]`; weakens remote ancestors |
 | `quantizationStep` | finite positive number | `0.000001` axial units |
 | `convergenceThresholds` | object | Assignment stability, target error, and anchor velocity limits |
 
@@ -113,7 +111,7 @@ Unified orchestration request for existing and force layouts.
 | `requestId` | positive integer | Monotonically increases in the page session |
 | `mode` | layout mode ID | Any existing or force mode |
 | `entities` | `NormalizedEntity[]` | Complete hierarchy snapshot |
-| `config` | `LayoutConfig` or `null` | Required only for force modes |
+| `config` | `LayoutConfig` or `null` | Required only for the force mode |
 
 Force requests cross the worker boundary. Existing modes may resolve synchronously behind the same promise-returning runner contract. Visual payload stays on the main thread.
 
@@ -125,7 +123,6 @@ Mutable worker-only DTO.
 |---|---|---|
 | `entityId` | string | Original normalized entity ID |
 | `kind` | `leaf` or `anchor` | Combined with `entityId` as a structured identity tuple |
-| `ancestorIds` | string[] | Leaf group-force memberships |
 | `x`, `y`, `vx`, `vy` | finite number | d3-force mutable state |
 | `fx`, `fy` | number or `null` | Set for leaves only during final in-simulation pin phase |
 | `cellQ`, `cellR` | integer or absent | Unique assignment for leaves; absent for anchors |
@@ -156,11 +153,11 @@ Invariants:
 - Previous assignment is always a protected fallback candidate.
 - Candidate and proposal cap derives from configured radius; radius three permits at most 38 proposals per leaf per epoch.
 - Final rendered coordinates are recomputed from `(q, r)`.
-- Any assignment outside configured radius 256 returns `UNSUPPORTED_SCALE` rather than expanding unboundedly.
+- Any assignment outside the fixed supported radius 256 returns `UNSUPPORTED_SCALE` rather than expanding unboundedly.
 
 ## VirtualAnchor
 
-Worker-only representation of one internal entity in anchor mode.
+Worker-only representation of one internal entity in the force-directed mode.
 
 | Field | Type | Rules |
 |---|---|---|
@@ -181,14 +178,14 @@ Collision-safe structured identity and position for one spring endpoint.
 
 ## ActiveSpring
 
-One hierarchy edge used by anchor-mode link force and debug rendering.
+One immediate-parent hierarchy edge used by the force-directed link force and debug rendering.
 
 | Field | Type | Rules |
 |---|---|---|
 | `source` | `SpringEndpoint` | Child leaf or child anchor |
 | `target` | `SpringEndpoint` | Immediate parent anchor |
 
-The structured tuple `(source.kind, source.entityId, target.kind, target.entityId)` is the stable key. Anchor mode returns one spring per non-root hierarchy entity; group mode returns `[]`.
+The structured tuple `(source.kind, source.entityId, target.kind, target.entityId)` is the stable key. The force-directed mode returns one spring per non-root hierarchy entity: leaf to immediate internal-parent anchor or nested anchor to immediate internal-parent anchor. A root leaf produces an empty spring list.
 
 ## LayoutPlacement
 
@@ -212,11 +209,11 @@ Domain-neutral summary derived from final placements.
 For each internal depth:
 
 - Build one cell set from all descendant leaf placements for every internal entity at that depth.
-- Non-root groups compare only with groups sharing the same parent; root groups compare with all other roots.
-- Pair gap is the minimum `axialDistance(firstCell, secondCell) - 1` over both groups' cells.
-- Each group contributes its nearest eligible pair gap once; `averageNearestGap` is the arithmetic mean of those group values.
-- Return `null` when fewer than two groups have an eligible comparison.
-- Sort entries by ascending depth and traverse groups in stable entity order/ID.
+- A non-root internal entity compares only with sibling internal entities sharing the same parent; a root compares with other roots.
+- Pair gap is the minimum `axialDistance(firstCell, secondCell) - 1` over both internal-entity cell sets.
+- Each internal entity contributes its nearest eligible pair gap once; `averageNearestGap` is the arithmetic mean of those values.
+- Return `null` when fewer than two internal entities have an eligible comparison.
+- Sort entries by ascending depth and traverse internal entities in stable entity order/ID.
 
 The source/UI adapter may map depths to localized source-domain labels. Those names never enter layout output.
 
@@ -254,8 +251,8 @@ One shape for all modes.
 | `requestId` | positive integer | Must match latest request to commit |
 | `mode` | layout mode ID | Matches request |
 | `placements` | `LayoutPlacement[]` | One per leaf |
-| `springs` | `ActiveSpring[]` | Empty except anchor mode |
-| `gridRadius` | finite non-negative number | No greater than 256 |
+| `springs` | `ActiveSpring[]` | Immediate-parent springs for the force mode; empty for existing modes |
+| `gridRadius` | non-negative integer | No greater than 256 |
 | `stats` | `LayoutStats` | Generic hierarchy summary |
 | `diagnostics` | discriminated diagnostics | Legacy or force variant matching mode |
 
@@ -275,23 +272,34 @@ Exact error object used by runner promises and UI mapping.
 Codes:
 
 - Input/algorithm: `UNKNOWN_MODE`, `EMPTY_HIERARCHY`, `INVALID_HIERARCHY`, `UNSUPPORTED_SCALE`, `NON_FINITE_STATE`, `ASSIGNMENT_INVARIANT`, `NOT_CONVERGED`.
-- Environment/transport: `UNSUPPORTED_ENVIRONMENT`, `WORKER_START_FAILED`, `WORKER_MESSAGE_FAILED`, `TIMEOUT`, `CANCELLED`, `INTERNAL_ERROR`. `TIMEOUT` is an independently configured stuck-worker safety guard and is not the 2/8-second performance acceptance threshold.
+- Environment/transport: `UNSUPPORTED_ENVIRONMENT`, `WORKER_START_FAILED`, `WORKER_MESSAGE_FAILED`, `TIMEOUT`, `CANCELLED`, `INTERNAL_ERROR`. `TIMEOUT` is the independently configured 60,000 ms production stuck-worker safety guard, dependency-injected as 50 ms in timeout tests, and is not the 2/8-second performance acceptance threshold.
 - Rendering: `WEBGL_UNAVAILABLE`, `RENDER_FAILED`.
 
 Workers return only code and diagnostic details. `main.js` maps codes to localized live-region text. Cancellation superseded by a newer request rejects its runner promise with `silent: true` and never announces an error.
+
+## LayoutRunnerConfig
+
+Runner-only lifecycle configuration; it never crosses the worker boundary and cannot affect successful layout output.
+
+| Field | Type | Rules |
+|---|---|---|
+| `workerFactory` | function | Dependency-injected module-worker creator for production and lifecycle tests |
+| `hangGuardMs` | positive integer | Exactly `60000` in production; timeout tests inject exactly `50` |
+
+Guard expiry rejects with `TIMEOUT`, removes listeners, clears the timer, terminates the worker exactly once, and retains the currently committed world. The guard remains independent of performance acceptance statistics.
 
 ## IslandPresentation
 
 | Field | Type | Rules |
 |---|---|---|
-| `occupiedOpacity` | number | `0.5` for force modes; `1` otherwise |
-| `showSprings` | boolean | True only for anchor mode |
-| `springLevel` | number | Literal world `y = 0` |
+| `occupiedOpacity` | number | `0.5` for the force mode; `1` otherwise |
+| `showSprings` | boolean | True only for the force mode |
 
 Presentation cannot change hierarchy or placement semantics.
 
 Fixed rendering invariants, not caller-configurable fields:
 
+- Every spring vertex uses literal world `y = 0`.
 - Spring material uses `depthTest: true` and `depthWrite: false`.
 - Springs never clear depth or use an always-on-top overlay path.
 - Opaque geometry may occlude springs; translucent force-mode towers do not write depth and preserve spring visibility through their occupied volume.
@@ -302,9 +310,11 @@ Validation-only identity for one compatibility project.
 
 | Field | Type | Rules |
 |---|---|---|
+| `product` | enum | `chrome`, `firefox`, or `safari` |
 | `engine` | enum | `blink`, `gecko`, or `webkit` |
 | `release` | enum | `current` or `previous` stable at validation time |
-| `deviceClass` | enum | `desktop`, `phone`, or `tablet` |
+| `deviceClass` | enum | `desktop`, `phone`, or `tablet-hybrid` |
+| `platform` | enum | Applicable desktop/Android for Chrome and Firefox; macOS/iPhone/iPad for Safari |
 | `productVersion` | string | Exact branded product/engine version recorded with evidence |
 | `osDevice` | string | Exact OS and physical/emulated device context |
 | `viewport` | object | CSS width/height within the class boundary |
@@ -312,7 +322,7 @@ Validation-only identity for one compatibility project.
 | `webgl2` | boolean | Must be true for a supported run |
 | `moduleWorker` | boolean | Must be true for a supported run |
 
-The release-certification matrix contains all 18 combinations of three engines, two stable releases, and three device classes. Bundled Playwright revisions are portable automation targets, not substitutes for release identity.
+Product and engine pairs are fixed: Chrome/Blink, Firefox/Gecko, and Safari/WebKit. Chrome and Firefox use applicable desktop/laptop plus Android phone and Android tablet/hybrid targets; Safari uses macOS desktop/laptop, iPhone, and iPad. The release-certification matrix contains all 18 combinations of three product/engine pairs, two stable releases, and three device classes. Bundled Playwright revisions are portable automation targets, not substitutes for release identity.
 
 ## VisibilityCameraPreset
 
@@ -328,23 +338,37 @@ Validation-only camera state applied to an assigned control spring without chang
 | elevation | 30 degrees above surface | 30 degrees above surface |
 | distance | 43 world units | 72 world units |
 
-The fixture records the camera state before application and restores it afterward. It asserts that spring segments behind only translucent towers remain distinguishable and segments behind opaque geometry are occluded normally.
+The fixture records the camera state before application and restores it afterward.
+
+## VisibilityProbeSet
+
+Validation-only pixel oracle attached to a deterministic visibility fixture.
+
+| Field | Type | Rules |
+|---|---|---|
+| `visibleSpringRegions` | device-pixel rect[5x5][] | Covers every tested control-spring cross-section seen through translucent towers |
+| `adjacentBackgroundRegions` | device-pixel rect[5x5][] | One paired reference region for each visible spring region |
+| `opaqueOcclusionRegions` | device-pixel rect[5x5][] | Compared with the identical spring-disabled control frame |
+| `hoverRegions` | device-pixel rect[5x5][] | Compared with the unhovered tower reference state |
+| `selectionRegions` | device-pixel rect[5x5][] | Compared with the unselected tower reference state |
+
+Coordinates are screenshot device pixels after applying DPR, not CSS pixels. Contrast uses WCAG relative luminance `(L1 + 0.05) / (L2 + 0.05)` with `L1 >= L2` after standard sRGB linearization. Every visible-spring, hover, and selection region contains at least one pixel with contrast at least 3:1 against its paired reference. Every pixel in an opaque-occlusion region differs from the corresponding spring-disabled control pixel by at most 5 in each 8-bit RGB channel. Object-level assertions separately prove that color and height data mappings are unchanged.
 
 ## PerformanceSampleSet
 
-Validation-only measurements for one mode/fixture pair on the fixed reference device.
+Validation-only measurements for one force-mode fixture on the fixed reference device.
 
 | Field | Type | Rules |
 |---|---|---|
 | `warmupBuilds` | duration[2] | Recorded separately and excluded from acceptance calculations |
 | `measuredBuilds` | duration[10] | Full selector-to-commit durations |
-| `controlResponses` | duration[10] | One prescribed busy-state event-to-next-frame duration per measured build |
+| `controlResponses` | duration[10] | One `Tab` response per measured build after busy status, from focused-selector `keydown.timeStamp` to the first subsequent `requestAnimationFrame` callback |
 | `frameWindows` | duration[][] | For 4,800 leaves, ten five-second post-commit frame-delta windows |
 | `completionP95` | duration | Nearest rank `ceil(0.95 * 10) = 10` of `measuredBuilds` |
 | `controlResponseP95` | duration | Nearest rank 10 of `controlResponses` |
 | `frameMedian` | duration | Median of pooled deltas from the ten measured frame windows |
 
-Completion limits are 2 seconds at 1,200 leaves and 8 seconds at 4,800 leaves; control-response p95 is at most 100 ms; frame median is at most 33.3 ms. None of these values configures or triggers the worker hang guard.
+Completion limits are 2 seconds at 1,200 leaves and 8 seconds at 4,800 leaves; control-response p95 is at most 100 ms; frame median is at most 33.3 ms. None of these values configures or triggers the 60,000 ms production worker hang guard; timeout tests inject exactly 50 ms.
 
 ## Request Lifecycle
 

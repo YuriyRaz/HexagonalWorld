@@ -4,7 +4,7 @@
 
 **Decision**: Add `d3-force@3.0.0` as the only new runtime dependency and commit the resulting lockfile update. Import named ESM exports rather than the complete D3 bundle.
 
-**Rationale**: The package is rendering-independent, works with the project's native ESM/Vite baseline, provides composable links, many-body force, fixed positions, seeded randomness, manual ticks, and custom-force initialization. Its unpacked package size is approximately 90 KB before dependency deduplication. These are the mature physics primitives the feature needs while leaving hierarchy grouping and hex assignment in project-owned code.
+**Rationale**: The package is rendering-independent, works with the project's native ESM/Vite baseline, provides composable links, many-body force, fixed positions, seeded randomness, manual ticks, and custom-force initialization. Its unpacked package size is approximately 90 KB before dependency deduplication. These are the mature physics primitives the feature needs while leaving generic virtual-anchor construction and hex assignment in project-owned code.
 
 **Alternatives considered**:
 
@@ -14,7 +14,7 @@
 
 ## Decision 2: Run Static Force Calculation In A Module Worker
 
-**Decision**: Run both force modes in a Vite-bundled module worker. Stop the automatic d3-force timer and execute a fixed manual tick schedule. The runner owns one active worker, terminates it when superseded, and accepts only a matching request ID.
+**Decision**: Run the force-directed mode in a Vite-bundled module worker. Stop the automatic d3-force timer and execute a fixed manual tick schedule. The runner owns one active worker, terminates it when superseded, and accepts only a matching request ID.
 
 **Rationale**: `simulation.tick(count)` is synchronous and emits no timer events. At 4,800 leaves, many-body quadtrees and custom assignment can block input if run on the main thread. A worker directly satisfies the requirement that controls remain usable and provides a clear cancellation/resource owner.
 
@@ -72,21 +72,22 @@
 - Increasing attraction strength alone can oscillate or leave floating residual error.
 - Accepting the final state when a hang guard expires would make successful results machine-dependent.
 
-## Decision 7: Generalize Both Grouping Modes Over Arbitrary Hierarchy
+## Decision 7: Generalize Virtual Anchors Over Arbitrary Hierarchy
 
-**Decision**: Derive leaves and internal entities from normalized parent relationships. Anchor mode creates one simulation-only anchor per internal entity and one active link per child-parent relationship. Group mode creates no anchors or links and applies reusable centroid forces for each leaf-to-ancestor membership with strength decaying by hierarchy distance.
+**Decision**: Derive leaves and internal entities from normalized parent relationships. The force-directed mode creates one simulation-only anchor per applicable internal entity and one active link for each leaf-to-immediate-parent or nested-anchor-to-immediate-parent relationship. The custom hex-cell force remains separate and runs every tick; no second grouping force or direct all-ancestor link set is created. The request is unsupported when this construction exceeds 5,999 active links/springs.
 
-**Rationale**: This maps arbitrary internal-entity grouping factors without making source-domain types part of the layout and supports different hierarchy depths. Anchor work is linear in hierarchy edges. Group-force work is `O(M)`, where `M` is total leaf-to-ancestor memberships and is at most two memberships per leaf in the current data.
+**Rationale**: This maps arbitrary internal-entity grouping factors without making source-domain types part of the layout, supports different hierarchy depths, and directly produces the approved debug springs. Anchor/link construction is linear in hierarchy edges and is simpler to explain, test, and maintain than a second custom grouping algorithm.
 
 **Alternatives considered**:
 
 - Hardcoded source-domain forces violate domain neutrality.
 - Pairwise links among all members create artificial semantics, `O(n^2)` edges, and unusable debug clutter.
 - A representative visible leaf per group makes one business entity arbitrarily special.
+- A separate centroid-based grouping force duplicates behavior without producing inspectable springs and expands implementation and validation scope.
 
 ## Decision 8: Omit Collision Force Until Measurement Justifies It
 
-**Decision**: Start with many-body separation, grouping/link forces, weak centering, and the authoritative hex-assignment force. Do not add `forceCollide` unless benchmarks or visual fixtures show harmful transient overlap.
+**Decision**: Start with many-body separation, immediate-parent link forces, weak centering, and the authoritative hex-assignment force. Do not add `forceCollide` unless benchmarks or visual fixtures show harmful transient overlap.
 
 **Rationale**: Unique final cells already guarantee tower non-overlap. Collision builds another quadtree and each additional collision iteration multiplies that cost. The constitution requires optimizations and complexity to respond to measured bottlenecks rather than speculation.
 
@@ -97,7 +98,7 @@
 
 ## Decision 9: Return Typed Results And Fail Transactionally
 
-**Decision**: Worker responses are either a complete validated `LayoutResult` or a non-localized typed code/details failure. The runner adds empty/invalid/overscale, unsupported environment, worker startup/message, independently configured hang-guard expiry, cancellation, and internal failures; rendering adds WebGL/resource failures. `main.js` alone maps codes to localized text. The current island remains mounted until a candidate result has rendered successfully.
+**Decision**: Worker responses are either a complete validated `LayoutResult` or a non-localized typed code/details failure. More than 5,999 active links is rejected before simulation and a computed final radius above 256 is rejected before result publication, both as `UNSUPPORTED_SCALE`. The runner adds empty/invalid/overscale, unsupported environment, worker startup/message, independently configured hang-guard expiry, cancellation, and internal failures; rendering adds WebGL/resource failures. `main.js` alone maps codes to localized text. The current island remains mounted until a candidate result has rendered successfully.
 
 **Rationale**: Partial positions would violate deterministic and unique-cell guarantees. Transactional replacement meets the resilience requirement and prevents the current valid world from disappearing when calculation or resource creation fails.
 
@@ -108,7 +109,7 @@
 
 ## Decision 10: Batch Debug Springs With Physical Depth Occlusion
 
-**Decision**: Render anchor-mode springs as one `LineSegments` geometry at literal world `y = 0`, with `depthTest: true` and `depthWrite: false`. Do not clear scene depth or force the lines into an always-on-top overlay. Opaque geometry may occlude them; force-mode towers remain translucent and do not write depth, allowing the lines to remain distinguishable through towers. Return no spring object in group mode. The island factory owns every allocation until successful return and cleans partial failures; ownership then transfers wholly to the handle.
+**Decision**: Render force-mode springs as one `LineSegments` geometry at literal world `y = 0`, with `depthTest: true` and `depthWrite: false`. Do not clear scene depth or force the lines into an always-on-top overlay. Opaque geometry may occlude them; force-mode towers remain translucent and do not write depth, allowing the lines to remain distinguishable through towers. If the validated active relation set is empty, create no spring object. The island factory owns every allocation until successful return and cleans partial failures; ownership then transfers wholly to the handle.
 
 **Rationale**: The approved behavior is a scene element that participates in physical occlusion, not a diagnostic overlay. One buffer avoids one draw object per spring and simplifies cleanup. The prescribed camera fixtures verify visibility through translucent towers and correct occlusion instead of assuming visibility through every surface. Springs remain excluded from raycasting.
 
@@ -120,7 +121,7 @@
 
 ## Decision 11: Use Layered Automated And Browser Validation
 
-**Decision**: Use Node's built-in test runner for pure contracts and Playwright for interaction/visual behavior. Portable Playwright projects cover bundled Chromium, Firefox, and WebKit across desktop, phone, and tablet viewport/input classes, plus exact desktop and mobile visibility cameras. Separate release certification covers current and immediately previous stable Blink, Gecko, and WebKit products in every applicable device class. Benchmark two warmups and ten measured end-to-end runs at 1,200 and 4,800 leaves on the documented i7-1360P/32 GB Windows Chromium reference project, including worker startup through render commit; compute nearest-rank p95 completion and control response plus the pooled post-commit frame median. Do not enforce hardware-sensitive timing in generic CI until a matching stable runner exists.
+**Decision**: Use Node's built-in test runner for pure contracts and Playwright for interaction/visual behavior. Nine portable Playwright projects cover bundled Chromium, Firefox, and WebKit across desktop, phone, and tablet viewport/input classes, plus focused projects for the exact desktop and mobile visibility cameras. The visual oracle uses predefined 5x5 screenshot-device-pixel regions, WCAG relative-luminance contrast after sRGB linearization, at least one 3:1 pixel for visible spring/hover/selection regions, and at most 5 RGB levels per channel against a spring-disabled control for opaque occlusion. Separate release certification covers current and previous stable Google Chrome/Blink on desktop and Android phone/tablet, Mozilla Firefox/Gecko on desktop and Android phone/tablet, and Apple Safari/WebKit on macOS, iPhone, and iPad. Benchmark two warmups and ten measured end-to-end runs per fixture at 1,200 and 4,800 leaves on the documented i7-1360P/32 GB Windows Chromium reference project, including worker startup through render commit; compute nearest-rank p95 completion and control response plus the pooled post-commit frame median. Do not enforce hardware-sensitive timing in generic CI until a matching stable runner exists.
 
 **Rationale**: Layout, assignment, determinism, and failure contracts run without a browser and need precise regression tests. Transparency sorting, physical depth occlusion, live status, keyboard behavior, cancellation, and responsive presentation require browser scenarios. Bundled Playwright engines provide repeatable automation but do not certify both stable release trains or branded Safari, so versioned product/device evidence is recorded separately. No additional test framework is needed because Playwright is already installed and Node supplies the pure runner.
 
@@ -133,7 +134,7 @@
 
 ## Decision 12: Separate Performance Statistics From Runtime Safety
 
-**Decision**: For each mode/fixture, run two unmeasured warmups and ten measured builds. Compute completion nearest-rank p95 from the ten build durations and control-response nearest-rank p95 from one prescribed busy-state response observation per measured build; rank `ceil(0.95 * 10) = 10` is the slowest observation. For 4,800-leaf fixtures, pool frame deltas from ten five-second post-commit windows and compute one median. Keep an independently configured worker hang guard solely for stuck-resource recovery; it is not equal to or derived from the 2/8-second acceptance thresholds and does not determine layout output.
+**Decision**: For each fixture in the force mode, run two unmeasured warmups and ten measured builds. Compute completion nearest-rank p95 from the ten build durations. For each control-response sample, wait for busy status while the algorithm selector remains focused, press `Tab` once, and measure `keydown.timeStamp` to the first subsequent `requestAnimationFrame` callback; rank `ceil(0.95 * 10) = 10` is the slowest observation. For 4,800-leaf fixtures, pool frame deltas from ten five-second post-commit windows and compute one median. Use a 60,000 ms production worker hang guard and dependency-inject exactly 50 ms in timeout tests solely for stuck-resource recovery; expiry terminates and cleans the worker, never accepts its output, and is not equal to or derived from the 2/8-second acceptance thresholds.
 
 **Rationale**: Explicit sample populations make all three metrics reproducible. Statistical limits assess expected product performance without making valid output depend on device speed, while a separate safety guard still bounds leaked or permanently stuck worker resources.
 
@@ -145,7 +146,7 @@
 
 ## Decision 13: Compute Generic Boundary Gaps With A Hex Wavefront
 
-**Decision**: Preserve the existing minimum axial cell-gap meaning but calculate it generically by internal-entity depth and sibling partition. Use a deterministic multi-source hex-grid wavefront within the bounded layout radius to discover nearest boundaries between distinct groups, then average each group's nearest eligible gap.
+**Decision**: Preserve the existing minimum axial cell-gap meaning but calculate it generically by internal-entity depth and sibling partition. Use a deterministic multi-source hex-grid wavefront within the bounded layout radius to discover nearest boundaries between distinct groups, then average each group's nearest eligible gap. Radius 256 is accepted; a computed radius of 257 or greater returns `UNSUPPORTED_SCALE` instead of expanding or clamping the wavefront.
 
 **Rationale**: The current nested group/cell comparisons can approach quadratic work and would undermine the 4,800-leaf budget. The final force output already occupies unique integer cells inside radius 256, making bounded wavefront traversal exact, domain-neutral, and practical across supported hierarchy depths.
 
