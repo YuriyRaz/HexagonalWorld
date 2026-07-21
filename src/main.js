@@ -5,6 +5,7 @@ import { generateSchoolData, adaptSchoolData } from './data.js';
 import { createIsland } from './island.js';
 import { layoutAlgorithms } from './layout.js';
 import { createLayoutRunner } from './layout-runner.js';
+import { FORCE_LAYOUT_CONFIG } from './force-layout.js';
 import './style.css';
 
 const canvas = document.querySelector('#world');
@@ -162,6 +163,10 @@ const layoutRunner = createLayoutRunner({
   hangGuardMs: 60000
 });
 
+window.addEventListener('beforeunload', () => {
+  layoutRunner.dispose();
+});
+
 let activeIslandHandle = null;
 let activeLayoutResult = null;
 let activeDataSnapshot = null;
@@ -169,7 +174,6 @@ let activeVisualPayloadByEntityId = null;
 
 let requestIdCounter = 0;
 let lastErrorCode = null;
-let requestedMode = algorithmSelect.value;
 let isBusy = false;
 
 window.__hexWorldTest = {
@@ -179,13 +183,29 @@ window.__hexWorldTest = {
   getState: () => ({
     productionHangGuardMs: 60000,
     latestRequestId: requestIdCounter,
-    requestedMode: requestedMode,
-    activeMode: activeLayoutResult?.mode || requestedMode,
+    requestedMode: algorithmSelect.value,
+    activeMode: activeLayoutResult?.mode || algorithmSelect.value,
     busy: isBusy,
-    lastErrorCode: lastErrorCode,
+    lastErrorCode,
     activeRootId: activeIslandHandle?.root.uuid || null,
     activeResult: activeLayoutResult ? structuredClone(activeLayoutResult) : null,
   })
+};
+
+const ERROR_TRANSLATIONS = {
+  EMPTY_HIERARCHY: 'Ошибка: пустая иерархия',
+  INVALID_HIERARCHY: 'Ошибка: некорректная иерархия',
+  UNSUPPORTED_SCALE: 'Ошибка: неподдерживаемый масштаб',
+  NON_FINITE_STATE: 'Ошибка: недопустимое состояние',
+  ASSIGNMENT_INVARIANT: 'Ошибка: нарушение распределения',
+  NOT_CONVERGED: 'Ошибка: алгоритм не сошёлся',
+  UNSUPPORTED_ENVIRONMENT: 'Ошибка: неподдерживаемая среда',
+  WORKER_START_FAILED: 'Ошибка: не удалось запустить worker',
+  WORKER_MESSAGE_FAILED: 'Ошибка: сбой сообщения worker',
+  TIMEOUT: 'Ошибка: превышено время ожидания',
+  WEBGL_UNAVAILABLE: 'Ошибка: WebGL недоступен',
+  RENDER_FAILED: 'Ошибка: сбой рендеринга',
+  INTERNAL_ERROR: 'Ошибка: внутренняя ошибка',
 };
 
 let currentSchoolData = generateSchoolData();
@@ -193,14 +213,16 @@ let currentSchoolData = generateSchoolData();
 async function rebuildIsland() {
   requestIdCounter++;
   const currentRequestId = requestIdCounter;
-  requestedMode = algorithmSelect.value;
-  
+
   isBusy = true;
   lastErrorCode = null;
   const statusEl = document.querySelector('#layout-status');
-  if (statusEl) statusEl.textContent = 'Вычисляем...';
+  if (statusEl) {
+    statusEl.textContent = 'Вычисляем...';
+    statusEl.classList.remove('is-error');
+  }
+  algorithmNote.textContent = layoutAlgorithms[algorithmSelect.value].note;
   generatorForm.setAttribute('aria-busy', 'true');
-  algorithmSelect.disabled = true;
 
   let config = window.__hexWorldTest.nextConfig || {};
   window.__hexWorldTest.nextConfig = null;
@@ -210,8 +232,10 @@ async function rebuildIsland() {
   if (config.entities) {
     entities = config.entities;
     // tests pass pure entities, we must mock payload for them so createIsland won't fail
+    const parentIds = new Set(entities.filter(e => e.parentId !== null).map(e => e.parentId));
+    const leafEntities = entities.filter(e => !parentIds.has(e.id));
     visualPayloadByEntityId = new Map();
-    entities.forEach(e => {
+    leafEntities.forEach(e => {
       visualPayloadByEntityId.set(e.id, {
         entityId: e.id,
         title: `Test ${e.id}`,
@@ -230,19 +254,27 @@ async function rebuildIsland() {
   }
 
   try {
+    const layoutConfig = config.failure 
+      ? { __testFailure: config.failure } 
+      : (algorithmSelect.value === 'force-anchors' ? structuredClone(FORCE_LAYOUT_CONFIG) : null);
+    if (layoutConfig && config.delayMs) {
+      layoutConfig.delayMs = config.delayMs;
+    }
+
     const layoutResult = await layoutRunner.runLayout({
       requestId: currentRequestId,
-      mode: requestedMode,
+      mode: algorithmSelect.value,
       entities,
-      config: config.failure ? { __testFailure: config.failure } : config
+      config: layoutConfig
     });
     
     if (currentRequestId !== requestIdCounter) return;
 
-    const presentation = layoutAlgorithms[requestedMode];
+    const presentation = layoutAlgorithms[algorithmSelect.value];
     const newHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
     
     clearSelection();
+    world.add(newHandle.root);
     if (activeIslandHandle) {
       world.remove(activeIslandHandle.root);
       activeIslandHandle.dispose();
@@ -252,8 +284,6 @@ async function rebuildIsland() {
     activeLayoutResult = layoutResult;
     activeDataSnapshot = currentSchoolData;
     activeVisualPayloadByEntityId = visualPayloadByEntityId;
-    
-    world.add(activeIslandHandle.root);
     tiles = activeIslandHandle.interactiveTiles;
     waterRings = activeIslandHandle.waterRings;
     
@@ -261,19 +291,26 @@ async function rebuildIsland() {
     if (!useTestEntities) {
       updateWorldSummary(activeIslandHandle.stats, activeDataSnapshot);
     }
-    if (statusEl) statusEl.textContent = 'Успешно завершено.';
+    if (statusEl) {
+      statusEl.textContent = 'Успешно завершено.';
+      statusEl.classList.remove('is-error');
+    }
     
   } catch (err) {
+    console.error('rebuildIsland error:', err);
     if (currentRequestId !== requestIdCounter) return;
     if (err.code !== 'CANCELLED') {
       lastErrorCode = err.code || 'UNKNOWN';
-      if (statusEl) statusEl.textContent = `Ошибка: не удалось рассчитать (${lastErrorCode})`;
+      const message = ERROR_TRANSLATIONS[lastErrorCode] || `Ошибка: не удалось рассчитать (${lastErrorCode})`;
+      if (statusEl) {
+        statusEl.textContent = message + ' Предыдущий мир сохранён.';
+        statusEl.classList.add('is-error');
+      }
     }
   } finally {
     if (currentRequestId === requestIdCounter) {
       isBusy = false;
       generatorForm.removeAttribute('aria-busy');
-      algorithmSelect.disabled = false;
     }
   }
 }
@@ -395,6 +432,7 @@ function setTileState(tile) {
 
 function updateHover() {
   if (!interactionDirty) return;
+  if (performance.now() - frameStartTime > 16) return;
   interactionDirty = false;
   raycaster.setFromCamera(pointer, camera);
   const intersection = raycaster.intersectObjects(tiles, false)[0];
@@ -491,8 +529,10 @@ addEventListener('resize', onResize);
 
 const clock = new THREE.Clock();
 const cameraDirection = new THREE.Vector3();
+let frameStartTime = 0;
 function animate(time) {
-  requestAnimationFrame(animate);
+requestAnimationFrame(animate);
+  frameStartTime = performance.now();
   const elapsed = clock.getElapsedTime();
   animateCamera(time);
   controls.update();
