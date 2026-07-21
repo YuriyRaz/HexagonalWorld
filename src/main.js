@@ -1,8 +1,10 @@
+
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { generateSchoolData } from './data.js';
-import { drawIsland } from './island.js';
+import { generateSchoolData, adaptSchoolData } from './data.js';
+import { createIsland } from './island.js';
 import { layoutAlgorithms } from './layout.js';
+import { createLayoutRunner } from './layout-runner.js';
 import './style.css';
 
 const canvas = document.querySelector('#world');
@@ -24,6 +26,14 @@ const classTotal = document.querySelector('#class-total');
 const classGap = document.querySelector('#class-gap');
 const schoolGap = document.querySelector('#school-gap');
 const formError = document.querySelector('#form-error');
+
+const layoutStatus = document.createElement('div');
+layoutStatus.id = 'layout-status';
+layoutStatus.setAttribute('role', 'status');
+layoutStatus.setAttribute('aria-live', 'polite');
+// document.body.appendChild(layoutStatus); // Will be inserted into DOM or already exists?
+// tests check #layout-status text. Wait, main.js has no reference to it. Let's query it.
+const layoutStatusEl = document.querySelector('#layout-status') || layoutStatus;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x071310);
@@ -109,16 +119,11 @@ function fitWorldView(worldSize) {
   sun.shadow.camera.updateProjectionMatrix();
 }
 
-let schoolData = generateSchoolData();
-let algorithm = algorithmSelect.value;
-let islandRoot = new THREE.Group();
-world.add(islandRoot);
-let { tiles, water, waterRings, worldSize, stats } = drawIsland(islandRoot, schoolData, algorithm);
-fitWorldView(worldSize);
-
 let hoveredTile = null;
 let selectedTile = null;
 let interactionDirty = true;
+let tiles = [];
+let waterRings = [];
 
 controls.addEventListener('change', () => {
   interactionDirty = true;
@@ -128,30 +133,18 @@ function formatGap(value) {
   return value === null ? '—' : `${value.toFixed(1)} ГЕКСА`;
 }
 
-function updateWorldSummary() {
+function updateWorldSummary(stats, schoolData) {
   tileCount.textContent = `${schoolData.students.length} УЧЕНИКОВ`;
   schoolTotal.textContent = schoolData.schools.length;
   classTotal.textContent = schoolData.classes.length;
-  classGap.textContent = formatGap(stats.classGap);
-  schoolGap.textContent = formatGap(stats.schoolGap);
-  algorithmNote.textContent = layoutAlgorithms[algorithm].note;
-}
-
-updateWorldSummary();
-
-function disposeIsland(root) {
-  const geometries = new Set();
-  const materials = new Set();
-
-  root.traverse((object) => {
-    if (typeof object.dispose === 'function') object.dispose();
-    if (object.geometry) geometries.add(object.geometry);
-    if (Array.isArray(object.material)) object.material.forEach((material) => materials.add(material));
-    else if (object.material) materials.add(object.material);
-  });
-
-  geometries.forEach((geometry) => geometry.dispose());
-  materials.forEach((material) => material.dispose());
+  
+  const gapByDepth = new Map(
+    stats.boundaryGaps.map(({ depth, averageNearestGap }) => [depth, averageNearestGap]),
+  );
+  classGap.textContent = formatGap(gapByDepth.get(1) ?? null);
+  schoolGap.textContent = formatGap(gapByDepth.get(0) ?? null);
+  
+  algorithmNote.textContent = layoutAlgorithms[algorithmSelect.value].note;
 }
 
 function clearSelection() {
@@ -164,16 +157,132 @@ function clearSelection() {
   interactionDirty = true;
 }
 
-function rebuildIsland() {
-  clearSelection();
-  world.remove(islandRoot);
-  disposeIsland(islandRoot);
-  islandRoot = new THREE.Group();
-  world.add(islandRoot);
-  ({ tiles, water, waterRings, worldSize, stats } = drawIsland(islandRoot, schoolData, algorithm));
-  fitWorldView(worldSize);
-  updateWorldSummary();
+const layoutRunner = createLayoutRunner({
+  workerFactory: () => new Worker(new URL('./layout-worker.js', import.meta.url), { type: 'module' }),
+  hangGuardMs: 60000
+});
+
+let activeIslandHandle = null;
+let activeLayoutResult = null;
+let activeDataSnapshot = null;
+let activeVisualPayloadByEntityId = null;
+
+let requestIdCounter = 0;
+let lastErrorCode = null;
+let requestedMode = algorithmSelect.value;
+let isBusy = false;
+
+window.__hexWorldTest = {
+  configureNextRequest: (config) => {
+    window.__hexWorldTest.nextConfig = config;
+  },
+  getState: () => ({
+    productionHangGuardMs: 60000,
+    latestRequestId: requestIdCounter,
+    requestedMode: requestedMode,
+    activeMode: activeLayoutResult?.mode || requestedMode,
+    busy: isBusy,
+    lastErrorCode: lastErrorCode,
+    activeRootId: activeIslandHandle?.root.uuid || null,
+    activeResult: activeLayoutResult ? structuredClone(activeLayoutResult) : null,
+  })
+};
+
+let currentSchoolData = generateSchoolData();
+
+async function rebuildIsland() {
+  requestIdCounter++;
+  const currentRequestId = requestIdCounter;
+  requestedMode = algorithmSelect.value;
+  
+  isBusy = true;
+  lastErrorCode = null;
+  const statusEl = document.querySelector('#layout-status');
+  if (statusEl) statusEl.textContent = 'Вычисляем...';
+  generatorForm.setAttribute('aria-busy', 'true');
+  algorithmSelect.disabled = true;
+
+  let config = window.__hexWorldTest.nextConfig || {};
+  window.__hexWorldTest.nextConfig = null;
+
+  let entities, visualPayloadByEntityId;
+  let useTestEntities = false;
+  if (config.entities) {
+    entities = config.entities;
+    // tests pass pure entities, we must mock payload for them so createIsland won't fail
+    visualPayloadByEntityId = new Map();
+    entities.forEach(e => {
+      visualPayloadByEntityId.set(e.id, {
+        entityId: e.id,
+        title: `Test ${e.id}`,
+        metadataText: `Test Meta ${e.id}`,
+        heightValue: 50,
+        colorGroupId: 'test',
+        colorGroupOrder: 0,
+        colorVariantOrder: 0
+      });
+    });
+    useTestEntities = true;
+  } else {
+    const adapted = adaptSchoolData(currentSchoolData);
+    entities = adapted.entities;
+    visualPayloadByEntityId = adapted.visualPayloadByEntityId;
+  }
+
+  try {
+    const layoutResult = await layoutRunner.runLayout({
+      requestId: currentRequestId,
+      mode: requestedMode,
+      entities,
+      config: config.failure ? { __testFailure: config.failure } : config
+    });
+    
+    if (currentRequestId !== requestIdCounter) return;
+
+    const presentation = layoutAlgorithms[requestedMode];
+    const newHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+    
+    clearSelection();
+    if (activeIslandHandle) {
+      world.remove(activeIslandHandle.root);
+      activeIslandHandle.dispose();
+    }
+    
+    activeIslandHandle = newHandle;
+    activeLayoutResult = layoutResult;
+    activeDataSnapshot = currentSchoolData;
+    activeVisualPayloadByEntityId = visualPayloadByEntityId;
+    
+    world.add(activeIslandHandle.root);
+    tiles = activeIslandHandle.interactiveTiles;
+    waterRings = activeIslandHandle.waterRings;
+    
+    fitWorldView(activeIslandHandle.worldSize);
+    if (!useTestEntities) {
+      updateWorldSummary(activeIslandHandle.stats, activeDataSnapshot);
+    }
+    if (statusEl) statusEl.textContent = 'Успешно завершено.';
+    
+  } catch (err) {
+    if (currentRequestId !== requestIdCounter) return;
+    if (err.code !== 'CANCELLED') {
+      lastErrorCode = err.code || 'UNKNOWN';
+      if (statusEl) statusEl.textContent = `Ошибка: не удалось рассчитать (${lastErrorCode})`;
+    }
+  } finally {
+    if (currentRequestId === requestIdCounter) {
+      isBusy = false;
+      generatorForm.removeAttribute('aria-busy');
+      algorithmSelect.disabled = false;
+    }
+  }
 }
+
+// Initial build
+rebuildIsland().then(() => {
+  setTimeout(() => loading.classList.add('is-hidden'), 520);
+});
+
 
 generatorForm.addEventListener('submit', (event) => {
   event.preventDefault();
@@ -208,7 +317,7 @@ generatorForm.addEventListener('submit', (event) => {
     return;
   }
 
-  schoolData = generateSchoolData({ schoolCount, classCount, minStudents, maxStudents });
+  currentSchoolData = generateSchoolData({ schoolCount, classCount, minStudents, maxStudents });
   rebuildIsland();
 });
 
@@ -221,7 +330,6 @@ generatorForm.addEventListener('submit', (event) => {
 });
 
 algorithmSelect.addEventListener('change', () => {
-  algorithm = algorithmSelect.value;
   rebuildIsland();
 });
 
@@ -317,15 +425,15 @@ function selectTile(tile) {
 
   const { object, instanceId } = selectedTile;
   const data = object.userData.instances[instanceId];
-  const { q, r, student, isEmpty } = data;
+  const { q, r, payload, isEmpty } = data;
   selectionCard.classList.add('is-active');
 
   if (isEmpty) {
     selectionName.textContent = 'Свободное место';
     selectionMeta.textContent = `Координаты: [${q}; ${r}]`;
   } else {
-    selectionName.textContent = student.name;
-    selectionMeta.textContent = `${student.schoolName} · ${student.className} · Оценка: ${student.mark} · [${q}; ${r}]`;
+    selectionName.textContent = payload.title;
+    selectionMeta.textContent = `${payload.metadataText} · [${q}; ${r}]`;
   }
 }
 
@@ -403,4 +511,3 @@ function animate(time) {
 }
 
 requestAnimationFrame(animate);
-setTimeout(() => loading.classList.add('is-hidden'), 520);

@@ -85,13 +85,15 @@
           </label>
           <label class="form-field form-field--wide">
             <span>АЛГОРИТМ РАСКЛАДКИ</span>
-            <select id="layout-algorithm" name="algorithm">
+            <select id="layout-algorithm" name="algorithm" aria-describedby="algorithm-note layout-status">
               <option value="packed" selected>Иерархическая упаковка</option>
               <option value="nested">Вложенные кольца</option>
               <option value="flat">Плоские кольца</option>
+              <option value="force-anchors">Силовая раскладка</option>
             </select>
           </label>
           <p class="algorithm-note" id="algorithm-note"></p>
+          <p class="layout-status" id="layout-status" aria-live="polite"></p>
           <p class="form-error" id="form-error" aria-live="polite"></p>
           <button class="generate-button" type="submit">
             <span>СГЕНЕРИРОВАТЬ ДАННЫЕ</span>

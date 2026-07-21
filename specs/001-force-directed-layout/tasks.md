@@ -23,9 +23,9 @@ description: "Implementation tasks for the force-directed layout"
 
 **Purpose**: Add the selected dependency and establish repeatable Node, portable-browser, focused-visual, and benchmark entry points.
 
-- [ ] T001 Install exact `d3-force@3.0.0` and add `test`, `test:e2e`, and `benchmark:layout` scripts in `package.json` and `package-lock.json`
-- [ ] T002 [P] Configure 16 Playwright projects - 9 portable projects (`desktop|phone|tablet` x `chromium|firefox|webkit`), 6 focused projects (`visual-desktop|visual-mobile` x `chromium|firefox|webkit`), and `benchmark-chromium` - with the prescribed viewport, DPR, input, and Vite web-server settings in `playwright.config.js`
-- [ ] T003 [P] Create deterministic valid, malformed, grouping, representative (1,200 leaves/20 depth-1 internals/5 roots/2,400 memberships/1,220 links), current-maximum (4,800 leaves/80 depth-1 internals/10 roots/9,600 memberships/4,880 links), structural-maximum (4,800 leaves/1,200 internals/depth 16/76,800 memberships/5,999 links/radius at most 256), 6,000-link rejection, radius-257 rejection, zero-spring, and camera/probe-region fixtures in `tests/fixtures/hierarchies.js`
+- [X] T001 Install exact `d3-force@3.0.0` and add `test`, `test:e2e`, and `benchmark:layout` scripts in `package.json` and `package-lock.json`
+- [X] T002 [P] Configure 16 Playwright projects - 9 portable projects (`desktop|phone|tablet` x `chromium|firefox|webkit`), 6 focused projects (`visual-desktop|visual-mobile` x `chromium|firefox|webkit`), and `benchmark-chromium` - with the prescribed viewport, DPR, input, and Vite web-server settings in `playwright.config.js`
+- [X] T003 [P] Create deterministic valid, malformed, grouping, representative (1,200 leaves/20 depth-1 internals/5 roots/2,400 memberships/1,220 links), current-maximum (4,800 leaves/80 depth-1 internals/10 roots/9,600 memberships/4,880 links), structural-maximum (4,800 leaves/1,200 internals/depth 16/76,800 memberships/5,999 links/radius at most 256), 6,000-link rejection, radius-257 rejection, zero-spring, and camera/probe-region fixtures in `tests/fixtures/hierarchies.js`
 
 **Checkpoint**: Dependencies, fixtures, and test entry points are ready.
 
@@ -37,14 +37,14 @@ description: "Implementation tasks for the force-directed layout"
 
 **Critical**: No user-story implementation begins until this phase passes its tests.
 
-- [ ] T004 [P] Write and observe failing tests for axial distance, canonical ring/spiral order, half-away-from-zero quantization, axial rounding, and axial-to-plane conversion in `tests/hex.test.js`
-- [ ] T005 Implement allocation-conscious axial helpers and constants that satisfy T004 in `src/hex.js`
-- [ ] T006 [P] Write and observe failing tests for stable hierarchy normalization, input immutability, generic visual payload, exact code-unit ID ordering, empty/duplicate/missing-parent/self-parent/cycle rejection, and request-computable entity/depth/membership limits in `tests/data.test.js`
-- [ ] T007 Refactor the source adapter to emit `NormalizedEntity[]` and a `VisualEntityPayload` lookup without changing generated user-visible data, satisfying T006 in `src/data.js`
-- [ ] T008 Write and observe failing regressions for existing flat/nested/packed placements, unified `LayoutResult`, unknown modes, generic depth-indexed boundary gaps, and deterministic multi-source hex-wavefront gaps after T005 and T007 in `tests/layout.test.js`
-- [ ] T009 Refactor existing layouts to consume normalized IDs/relationships/order, reuse `src/hex.js`, preserve placement and gap semantics, and return empty springs plus legacy diagnostics after T008 in `src/layout.js`
-- [ ] T010 Write and observe failing object tests for payload/cell/spring validation before allocation, generic payload joins, detached creation, opaque legacy presentation, partial-allocation cleanup, and idempotent handle disposal in `tests/island.test.js`
-- [ ] T011 Refactor rendering to consume a completed `LayoutResult`, build detached candidates, transfer all allocations to an idempotent `IslandHandle`, and preserve the existing opaque world after T010 in `src/island.js`
+- [X] T004 [P] Write and observe failing tests for axial distance, canonical ring/spiral order, half-away-from-zero quantization, axial rounding, and axial-to-plane conversion in `tests/hex.test.js`
+- [X] T005 Implement allocation-conscious axial helpers and constants that satisfy T004 in `src/hex.js`
+- [X] T006 [P] Write and observe failing tests for stable hierarchy normalization, input immutability, generic visual payload, exact code-unit ID ordering, empty/duplicate/missing-parent/self-parent/cycle rejection, and request-computable entity/depth/membership limits in `tests/data.test.js`
+- [X] T007 Refactor the source adapter to emit `NormalizedEntity[]` and a `VisualEntityPayload` lookup without changing generated user-visible data, satisfying T006 in `src/data.js`
+- [X] T008 Write and observe failing regressions for existing flat/nested/packed placements, unified `LayoutResult`, unknown modes, generic depth-indexed boundary gaps, and deterministic multi-source hex-wavefront gaps after T005 and T007 in `tests/layout.test.js`
+- [X] T009 Refactor existing layouts to consume normalized IDs/relationships/order, reuse `src/hex.js`, preserve placement and gap semantics, and return empty springs plus legacy diagnostics after T008 in `src/layout.js`
+- [X] T010 Write and observe failing object tests for payload/cell/spring validation before allocation, generic payload joins, detached creation, opaque legacy presentation, partial-allocation cleanup, and idempotent handle disposal in `tests/island.test.js`
+- [X] T011 Refactor rendering to consume a completed `LayoutResult`, build detached candidates, transfer all allocations to an idempotent `IslandHandle`, and preserve the existing opaque world after T010 in `src/island.js`
 
 **Checkpoint**: `npm test` passes for generic data, axial helpers, legacy layouts, generic statistics, and baseline island ownership.
 
@@ -58,18 +58,18 @@ description: "Implementation tasks for the force-directed layout"
 
 ### Validation for User Story 1
 
-- [ ] T012 [P] [US1] Write and observe failing force-layout tests for immutable request/config input, exact version-1 config, collision-safe structured identities, deterministic initialization, fixed 256-tick alpha phases, virtual anchors/immediate-parent links, 5,999 links accepted/6,000 rejected before simulation, bounded deferred assignment, radius 256 accepted/radius 257 rejected before publication, exact final pinning, convergence diagnostics, grouping ratio, all typed calculation failures, reordered input, and ten-run equality in `tests/force-layout.test.js`
-- [ ] T013 [P] [US1] Write and observe failing one-request worker tests for structured-clone-safe success/failure messages, request-ID agreement, and production-safe `INTERNAL_ERROR` serialization in `tests/layout-worker.test.js`
-- [ ] T014 [P] [US1] Write and observe failing runner tests for synchronous legacy dispatch, module-worker dispatch, 5,999-spring/radius-256 result revalidation, unsupported/startup/message failures, production `hangGuardMs=60000`, controlled-timer timeout with injected `hangGuardMs=50`, silent cancellation, stale responses, and exactly-once worker/listener/timer cleanup in `tests/layout-runner.test.js`
+- [X] T012 [P] [US1] Write and observe failing force-layout tests for immutable request/config input, exact version-1 config, collision-safe structured identities, deterministic initialization, fixed 256-tick alpha phases, virtual anchors/immediate-parent links, 5,999 links accepted/6,000 rejected before simulation, bounded deferred assignment, radius 256 accepted/radius 257 rejected before publication, exact final pinning, convergence diagnostics, grouping ratio, all typed calculation failures, reordered input, and ten-run equality in `tests/force-layout.test.js`
+- [X] T013 [P] [US1] Write and observe failing one-request worker tests for structured-clone-safe success/failure messages, request-ID agreement, and production-safe `INTERNAL_ERROR` serialization in `tests/layout-worker.test.js`
+- [X] T014 [P] [US1] Write and observe failing runner tests for synchronous legacy dispatch, module-worker dispatch, 5,999-spring/radius-256 result revalidation, unsupported/startup/message failures, production `hangGuardMs=60000`, controlled-timer timeout with injected `hangGuardMs=50`, silent cancellation, stale responses, and exactly-once worker/listener/timer cleanup in `tests/layout-runner.test.js`
 - [ ] T015 [US1] Write and observe failing browser scenarios for keyboard and touch selection, five-action keyboard limit, selector focus retained when busy begins, visible focus, boundary/short viewports, reduced motion, static results, busy/success/error live status, latest request wins, deterministic exposed results, and retained-world failures including unsupported link/radius and guard timeout in `tests/app.spec.js`
 
 ### Implementation for User Story 1
 
-- [ ] T016 [US1] Implement version-1 constants, hierarchy/config validation, exact ordering, Mulberry32, immutable simulation DTOs, canonical leaf initialization, quantized anchor initialization, and explicit stopped d3-force setup after T012 in `src/force-layout.js`
-- [ ] T017 [US1] Implement the custom hex-assignment force with radius-derived canonical candidates, protected previous cells, deterministic deferred acceptance, bounded proposal diagnostics, per-tick attraction, assignment lock, and final in-simulation `fx/fy` pinning after T016 in `src/force-layout.js`
-- [ ] T018 [US1] Implement virtual-anchor immediate-parent forces with the 5,999-link pre-simulation limit, manual 256-tick alpha scheduling, convergence/invariant checks, radius-256 result validation without clamping, quantized structured springs, grouping metrics, generic stats, and complete deterministic `LayoutResult` output after T017 in `src/force-layout.js`
-- [ ] T019 [P] [US1] Implement one-request module-worker calculation and production-safe success/failure serialization after T013 and T018 in `src/layout-worker.js`
-- [ ] T020 [P] [US1] Implement promise-based legacy/worker dispatch, dependency-injected worker creation, production `hangGuardMs=60000` and injectable `50` ms timeout tests, 5,999-spring/radius-256 response validation, silent supersession, stale-result rejection, timeout cleanup, and idempotent disposal after T014 and T018 in `src/layout-runner.js`
+- [X] T016 [US1] Implement version-1 constants, hierarchy/config validation, exact ordering, Mulberry32, immutable simulation DTOs, canonical leaf initialization, quantized anchor initialization, and explicit stopped d3-force setup after T012 in `src/force-layout.js`
+- [X] T017 [US1] Implement the custom hex-assignment force with radius-derived canonical candidates, protected previous cells, deterministic deferred acceptance, bounded proposal diagnostics, per-tick attraction, assignment lock, and final in-simulation `fx/fy` pinning after T016 in `src/force-layout.js`
+- [X] T018 [US1] Implement virtual-anchor immediate-parent forces with the 5,999-link pre-simulation limit, manual 256-tick alpha scheduling, convergence/invariant checks, radius-256 result validation without clamping, quantized structured springs, grouping metrics, generic stats, and complete deterministic `LayoutResult` output after T017 in `src/force-layout.js`
+- [X] T019 [P] [US1] Implement one-request module-worker calculation and production-safe success/failure serialization after T013 and T018 in `src/layout-worker.js`
+- [X] T020 [P] [US1] Implement promise-based legacy/worker dispatch, dependency-injected worker creation, production `hangGuardMs=60000` and injectable `50` ms timeout tests, 5,999-spring/radius-256 response validation, silent supersession, stale-result rejection, timeout cleanup, and idempotent disposal after T014 and T018 in `src/layout-runner.js`
 - [ ] T021 [US1] Add only the `force-anchors` mode with localized label/note, `isAsync`, `showSprings`, and `occupiedOpacity` metadata after T009 and T018 in `src/layout.js`
 - [ ] T022 [P] [US1] Add the single force option, associated algorithm note and live status, `aria-describedby`, and busy semantics after T015 in `index.html`
 - [ ] T023 [US1] Integrate normalized data, monotonic request IDs, `layout-runner`, detached island candidates, latest-request checks, and add-before-remove transactional world commits after T019-T022 in `src/main.js`

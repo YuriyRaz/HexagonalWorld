@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+build/
 coverage/
 
 # Test artifacts
@@ -29,6 +30,7 @@ pnpm-debug.log*
 .cyrus/session.json
 *.swp
 *.swo
+*.tmp
 .DS_Store
 Thumbs.db
 

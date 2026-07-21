@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test",
+    "test:e2e": "playwright test --grep-invert @benchmark",
+    "benchmark:layout": "playwright test tests/layout.benchmark.spec.js --project=benchmark-chromium"
   },
   "dependencies": {
+    "d3-force": "3.0.0",
     "three": "^0.178.0"
   },
   "devDependencies": {
