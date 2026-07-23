@@ -1,14 +1,16 @@
 import { calculateLayout } from './layout.js';
+import { calculateForceLayout } from './force-layout.js';
 
-export function handleWorkerMessage(message, postMessage, calculate) {
+export function handleWorkerMessage(message, postMessage, calculate, calculateForce) {
   if (!message || typeof message !== 'object') return;
   if (message.type !== 'calculate') return;
   if (!message.request) return;
 
   const requestId = message.request.requestId;
+  const calculateFn = (message.request.mode === 'force-anchors' && calculateForce) ? calculateForce : calculate;
 
   try {
-    const result = calculate(message.request);
+    const result = calculateFn(message.request);
     if (result.requestId !== requestId) {
       postMessage({
         type: 'failure',
@@ -41,6 +43,6 @@ export function handleWorkerMessage(message, postMessage, calculate) {
 
 if (typeof self !== 'undefined' && typeof window === 'undefined') {
   self.addEventListener('message', (event) => {
-    handleWorkerMessage(event.data, (msg) => self.postMessage(msg), calculateLayout);
+    handleWorkerMessage(event.data, (msg) => self.postMessage(msg), calculateLayout, calculateForceLayout);
   });
 }

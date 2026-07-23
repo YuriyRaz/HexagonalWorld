@@ -35,6 +35,7 @@ const profiles = [
 ]
 
 export default defineConfig({
+  timeout: 60000,
   testDir: './tests',
   outputDir: 'test-results',
   reporter: [

@@ -91,6 +91,16 @@ export function calculateForceLayout(request) {
     throw new ForceLayoutError('UNKNOWN_MODE', { mode: request.mode });
   }
 
+  if (request.config?.__testFailure) {
+    const { code, details } = request.config.__testFailure;
+    throw new ForceLayoutError(code, details || {});
+  }
+
+  if (request.config?.delayMs) {
+    const expiry = performance.now() + request.config.delayMs;
+    while (performance.now() < expiry) Math.random();
+  }
+
   let entities, analysis;
   try {
     const res = normalizeHierarchy(request.entities);
@@ -103,7 +113,7 @@ export function calculateForceLayout(request) {
     throw e;
   }
 
-  if (!assertDeepEqualConfig(request.config, FORCE_LAYOUT_CONFIG)) {
+  if (!request.config || typeof request.config.version !== 'number' || !assertDeepEqualConfig(request.config, FORCE_LAYOUT_CONFIG)) {
     throw new ForceLayoutError('INVALID_HIERARCHY', { reason: 'Invalid config drift' });
   }
 

@@ -28,14 +28,6 @@ const classGap = document.querySelector('#class-gap');
 const schoolGap = document.querySelector('#school-gap');
 const formError = document.querySelector('#form-error');
 
-const layoutStatus = document.createElement('div');
-layoutStatus.id = 'layout-status';
-layoutStatus.setAttribute('role', 'status');
-layoutStatus.setAttribute('aria-live', 'polite');
-// document.body.appendChild(layoutStatus); // Will be inserted into DOM or already exists?
-// tests check #layout-status text. Wait, main.js has no reference to it. Let's query it.
-const layoutStatusEl = document.querySelector('#layout-status') || layoutStatus;
-
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x071310);
 scene.fog = new THREE.FogExp2(0x071310, 0.021);
@@ -46,8 +38,8 @@ const defaultTarget = new THREE.Vector3(2.5, 1, 0);
 const defaultCameraDirection = defaultCameraPosition.clone().sub(defaultTarget).normalize();
 camera.position.copy(defaultCameraPosition);
 
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: true });
+renderer.setPixelRatio(devicePixelRatio);
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -75,6 +67,7 @@ controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
 controls.update();
 
 scene.add(new THREE.HemisphereLight(0xb9dac8, 0x112018, 1.7));
+scene.add(new THREE.AmbientLight(0xffffff, 2.0));
 
 const sun = new THREE.DirectionalLight(0xfff1c2, 3.1);
 sun.position.set(-13, 24, 12);
@@ -189,7 +182,54 @@ window.__hexWorldTest = {
     lastErrorCode,
     activeRootId: activeIslandHandle?.root.uuid || null,
     activeResult: activeLayoutResult ? structuredClone(activeLayoutResult) : null,
-  })
+    hoveredEntityId: hoveredTile ? (hoveredTile.object.userData.instances ? hoveredTile.object.userData.instances[hoveredTile.instanceId]?.payload?.entityId : null) : null,
+    selectedEntityId: selectedTile ? (selectedTile.object.userData.instances ? selectedTile.object.userData.instances[selectedTile.instanceId]?.payload?.entityId : null) : null,
+  }),
+  forceRebuild: () => rebuildIsland(),
+  getCameraState: () => ({
+    position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+    target: { x: controls.target.x, y: controls.target.y, z: controls.target.z },
+    fov: camera.fov,
+  }),
+  setCameraState: (state) => {
+    if (state.position) camera.position.set(state.position.x, state.position.y, state.position.z);
+    if (state.target) controls.target.set(state.target.x, state.target.y, state.target.z);
+    if (state.fov) {
+      camera.fov = state.fov;
+      camera.updateProjectionMatrix();
+    }
+    controls.update();
+    interactionDirty = true;
+  },
+  setSpringsVisible: (visible) => {
+    if (!activeIslandHandle) return;
+    activeIslandHandle.root.traverse((child) => {
+      if (child instanceof THREE.LineSegments) {
+        child.visible = visible;
+      }
+    });
+    renderer.render(scene, camera);
+  },
+  getTilePositions: () => {
+    if (!activeIslandHandle) return [];
+    const occupied = activeIslandHandle.interactiveTiles.find(t => !t.userData.isEmpty);
+    if (!occupied) return [];
+    return occupied.userData.instances.map(inst => ({
+      entityId: inst.payload.entityId,
+      x: inst.x,
+      y: inst.y,
+      z: inst.z
+    }));
+  },
+  projectToScreen: (x, y, z) => {
+    const vector = new THREE.Vector3(x, y, z);
+    vector.x += 3.3;
+    vector.project(camera);
+    return {
+      x: Math.round((vector.x + 1) * window.innerWidth / 2),
+      y: Math.round((-vector.y + 1) * window.innerHeight / 2)
+    };
+  },
 };
 
 const ERROR_TRANSLATIONS = {
@@ -261,12 +301,17 @@ async function rebuildIsland() {
       layoutConfig.delayMs = config.delayMs;
     }
 
-    const layoutResult = await layoutRunner.runLayout({
-      requestId: currentRequestId,
-      mode: algorithmSelect.value,
-      entities,
-      config: layoutConfig
-    });
+    let layoutResult;
+    if (config.layoutResult) {
+      layoutResult = { ...config.layoutResult, requestId: currentRequestId };
+    } else {
+      layoutResult = await layoutRunner.runLayout({
+        requestId: currentRequestId,
+        mode: algorithmSelect.value,
+        entities,
+        config: layoutConfig
+      });
+    }
     
     if (currentRequestId !== requestIdCounter) return;
 
@@ -292,7 +337,14 @@ async function rebuildIsland() {
       updateWorldSummary(activeIslandHandle.stats, activeDataSnapshot);
     }
     if (statusEl) {
-      statusEl.textContent = 'Успешно завершено.';
+      if (layoutResult.mode === 'force-anchors') {
+        const msg = `Успешно завершено. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные (50%).`;
+        statusEl.textContent = msg;
+        canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные.`);
+      } else {
+        statusEl.textContent = 'Успешно завершено.';
+        canvas.setAttribute('aria-label', 'Интерактивная трехмерная карта острова');
+      }
       statusEl.classList.remove('is-error');
     }
     
@@ -391,8 +443,8 @@ const tilePosition = new THREE.Vector3();
 const tileRotation = new THREE.Quaternion();
 const tileScale = new THREE.Vector3();
 const tileColor = new THREE.Color();
-const hoverColor = new THREE.Color(0x8ecf8a);
-const selectedColor = new THREE.Color(0xb7df70);
+const hoverColor = new THREE.Color(0xffffff);
+const selectedColor = new THREE.Color(0xffffff);
 let pointerDown = null;
 let cameraTween = null;
 
@@ -424,8 +476,8 @@ function setTileState(tile) {
   object.instanceMatrix.needsUpdate = true;
 
   tileColor.fromArray(object.userData.baseColors, instanceId * 3);
-  if (isSelected) tileColor.lerp(selectedColor, 0.48);
-  else if (isHovered) tileColor.lerp(hoverColor, 0.32);
+  if (isSelected) tileColor.lerp(selectedColor, 0.8);
+  else if (isHovered) tileColor.lerp(hoverColor, 0.85);
   object.setColorAt(instanceId, tileColor);
   object.instanceColor.needsUpdate = true;
 }
@@ -521,7 +573,7 @@ function animateCamera(time) {
 function onResize() {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setPixelRatio(devicePixelRatio);
   renderer.setSize(innerWidth, innerHeight);
 }
 

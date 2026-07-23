@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+
 const REPRESENTATIVE_ROOTS = 5;
 const REPRESENTATIVE_INTERNALS_PER_ROOT = 4;
 const CURRENT_MAXIMUM_ROOTS = 10;
@@ -260,17 +262,51 @@ export function buildRadius257LayoutResult(requestId = 1) {
   return buildRadiusLayoutResult(257, requestId);
 }
 
-function buildProbeRegions(deviceWidth, deviceHeight) {
-  const centerX = Math.floor(deviceWidth / 2);
-  const centerY = Math.floor(deviceHeight / 2);
+const axialToPlane = (q, r) => ({
+  x: 1.3 * Math.sqrt(3) * (q + r / 2),
+  z: 1.3 * 1.5 * r
+});
+
+function getProjectedCoordinates(pos, target, distance, width, height) {
+  const camera = new THREE.PerspectiveCamera(34, width / height, 0.1, 180);
+  const elevationRad = 30 * Math.PI / 180;
+  const azimuthRad = 32 * Math.PI / 180;
+  const dy = distance * Math.sin(elevationRad);
+  const hDist = distance * Math.cos(elevationRad);
+  const dx = hDist * Math.sin(azimuthRad);
+  const dz = hDist * Math.cos(azimuthRad);
+
+  camera.position.set(target.x + dx, target.y + dy, target.z + dz);
+  camera.lookAt(target.x, target.y, target.z);
+  camera.updateMatrixWorld();
+
+  const vector = new THREE.Vector3(pos.x + 3.3, pos.y || 0, pos.z);
+  vector.project(camera);
+  return {
+    x: Math.round((vector.x + 1) * width / 2),
+    y: Math.round((-vector.y + 1) * height / 2)
+  };
+}
+
+function buildProbeRegions(width, height, distance) {
   const rect = (x, y) => ({ x, y, width: 5, height: 5 });
+  const target = { x: 3.3, y: 0, z: 0 };
+
+  const pSpring = getProjectedCoordinates({ x: 0, y: 0, z: 0 }, target, distance, width, height);
+  const pOccluder = getProjectedCoordinates({ x: 0, y: 1.0675, z: 0 }, target, distance, width, height);
+  const leftPt = axialToPlane(-2, 0);
+  const pLeft = getProjectedCoordinates({ x: leftPt.x, y: 1.0675, z: leftPt.z }, target, distance, width, height);
+  const rightPt = axialToPlane(1, -2);
+  const pRight = getProjectedCoordinates({ x: rightPt.x, y: 1.0675, z: rightPt.z }, target, distance, width, height);
 
   return {
-    visibleSpringRegions: [rect(centerX - 2, centerY - 2)],
-    adjacentBackgroundRegions: [rect(centerX + 10, centerY - 2)],
-    opaqueOcclusionRegions: [rect(centerX - 38, centerY + 22)],
-    hoverRegions: [rect(centerX - 98, centerY - 34)],
-    selectionRegions: [rect(centerX + 94, centerY - 34)],
+    visibleSpringRegions: [rect(pSpring.x - 2, pSpring.y - 2)],
+    adjacentBackgroundRegions: [rect(pSpring.x + 40 - 2, pSpring.y - 2)],
+    opaqueOcclusionRegions: [rect(pOccluder.x - 2, pOccluder.y - 2)],
+    hoverRegions: [rect(pLeft.x - 2, pLeft.y - 2)],
+    selectionRegions: [rect(pRight.x - 2, pRight.y - 2)],
+    hoverBackgroundRegions: [rect(pLeft.x - 240 - 2, pLeft.y - 2)],
+    selectionBackgroundRegions: [rect(pRight.x + 240 - 2, pRight.y - 2)],
   };
 }
 
@@ -366,10 +402,12 @@ export function buildVisibilityFixture() {
       desktop: buildProbeRegions(
         desktopCamera.screenshotDevicePixels.width,
         desktopCamera.screenshotDevicePixels.height,
+        desktopCamera.distance,
       ),
       mobile: buildProbeRegions(
         mobileCamera.screenshotDevicePixels.width,
         mobileCamera.screenshotDevicePixels.height,
+        mobileCamera.distance,
       ),
     },
   };
