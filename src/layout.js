@@ -353,7 +353,14 @@ function unknownMode(mode) {
 }
 
 export function calculateLayout(request) {
-  const { requestId, mode, entities: sourceEntities } = request;
+  const { requestId, mode, entities: sourceEntities, config } = request;
+  if (config?.__testFailure) {
+    const { code, details } = config.__testFailure;
+    const err = new Error(code);
+    err.code = code;
+    err.details = details || {};
+    throw err;
+  }
   if (!Object.hasOwn(layoutAlgorithms, mode)) throw unknownMode(mode);
 
   const { entities, analysis } = normalizeHierarchy(sourceEntities);

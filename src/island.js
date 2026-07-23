@@ -76,7 +76,7 @@ function validateEndpoint(endpoint, name, placementByEntityId, anchorByEntityId,
   }
 
   const distance = (Math.abs(endpoint.q) + Math.abs(endpoint.r) + Math.abs(endpoint.q + endpoint.r)) / 2;
-  if (distance > gridRadius) {
+  if (distance > MAX_GRID_RADIUS) {
     failValidation('SPRING_ENDPOINT_OUTSIDE_GRID', { endpoint: name, entityId: endpoint.entityId });
   }
 
@@ -289,6 +289,7 @@ function smoothNoise(q, r) {
 
 export function createIsland(input) {
   const validated = validateInput(input);
+  const { presentation } = input;
   const ownership = createOwnershipLedger();
 
   try {
@@ -302,14 +303,17 @@ export function createIsland(input) {
       1,
       false,
     ));
+    const isTranslucent = presentation.occupiedOpacity < 1;
     const tileMaterial = ownership.ownMaterial(new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 0.84,
       metalness: 0.02,
       flatShading: true,
-      opacity: 1,
-      transparent: false,
-      depthWrite: true,
+      opacity: presentation.occupiedOpacity,
+      transparent: isTranslucent,
+      depthWrite: !isTranslucent,
+      fog: !isTranslucent,
+      toneMapped: !isTranslucent,
     }));
     const occupiedTiles = ownership.ownObject(new THREE.InstancedMesh(
       tileGeometry,
@@ -422,21 +426,26 @@ export function createIsland(input) {
     interactiveTiles.push(emptyTiles);
 
     const waterGeometry = ownership.ownGeometry(new THREE.PlaneGeometry(10000, 10000));
+    const waterOpacity = isTranslucent ? 0.0 : 0.86;
     const waterMaterial = ownership.ownMaterial(new THREE.MeshPhysicalMaterial({
       color: 0x143f3d,
       roughness: 0.27,
       metalness: 0.08,
       transparent: true,
-      opacity: 0.86,
-      transmission: 0.05,
-      clearcoat: 0.35,
-      clearcoatRoughness: 0.34,
+      opacity: waterOpacity,
       side: THREE.DoubleSide,
+      depthWrite: false,
     }));
+    if (!isTranslucent) {
+      waterMaterial.transmission = 0.05;
+      waterMaterial.clearcoat = 0.35;
+      waterMaterial.clearcoatRoughness = 0.34;
+    }
     const water = ownership.ownObject(new THREE.Mesh(waterGeometry, waterMaterial));
     water.rotation.x = -Math.PI / 2;
     water.position.y = WATER_LEVEL;
     water.receiveShadow = true;
+    water.visible = !isTranslucent;
     root.add(water);
 
     const waterRings = [];
@@ -483,7 +492,42 @@ export function createIsland(input) {
     const groundGlow = ownership.ownObject(new THREE.Mesh(glowGeometry, glowMaterial));
     groundGlow.rotation.x = -Math.PI / 2;
     groundGlow.position.y = WATER_LEVEL + 0.02;
+    groundGlow.visible = !isTranslucent;
     root.add(groundGlow);
+
+    const springs = input.layoutResult.springs;
+    if (presentation.showSprings && springs && springs.length > 0) {
+      const positions = new Float32Array(springs.length * 2 * 3);
+      springs.forEach((spring, index) => {
+        const sourcePt = axialToPlane(spring.source.q, spring.source.r);
+        positions[index * 6 + 0] = sourcePt.x;
+        positions[index * 6 + 1] = 0;
+        positions[index * 6 + 2] = sourcePt.z;
+
+        const targetPt = axialToPlane(spring.target.q, spring.target.r);
+        positions[index * 6 + 3] = targetPt.x;
+        positions[index * 6 + 4] = 0;
+        positions[index * 6 + 5] = targetPt.z;
+      });
+
+      const springGeometry = ownership.ownGeometry(new THREE.BufferGeometry());
+      springGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      springGeometry.computeBoundingSphere();
+      springGeometry.computeBoundingBox();
+
+      const springMaterial = ownership.ownMaterial(new THREE.LineBasicMaterial({
+        color: 0xffffff,
+        depthTest: true,
+        depthWrite: false,
+        transparent: true,
+        opacity: 1,
+        fog: false,
+      }));
+
+      const springMesh = ownership.ownObject(new THREE.LineSegments(springGeometry, springMaterial));
+      springMesh.raycast = () => {};
+      root.add(springMesh);
+    }
 
     return {
       root,

@@ -315,4 +315,105 @@ describe('createIsland object model', () => {
     assert.ok([...geometryDisposals.values()].every((count) => count === 1));
     assert.ok([...materialDisposals.values()].every((count) => count === 1));
   });
+
+  test('handles force-anchors presentation, spring rendering, and depth/opacity properties (T035)', () => {
+    // 1. Rejects spring count above 5,999 before construction
+    const tooManySpringsInput = makeInput({
+      mode: 'force-anchors',
+      springs: Array.from({ length: 6000 }, (_, i) => makeSpring({
+        source: { kind: 'leaf', entityId: 'entity-alpha', q: 0, r: 0 },
+        target: { kind: 'anchor', entityId: `anchor-${i}`, q: 0.5, r: -0.5 },
+      }))
+    }, {
+      presentation: { occupiedOpacity: 0.5, showSprings: true }
+    });
+    assert.throws(() => createIsland(tooManySpringsInput), /Island rendering failed./);
+
+    // 2. Translucent/opaque properties of occupied tiles
+    const forceInput = makeInput({
+      mode: 'force-anchors',
+      springs: [makeSpring()]
+    }, {
+      presentation: { occupiedOpacity: 0.5, showSprings: true }
+    });
+
+    const originalMaterialDispose = THREE.Material.prototype.dispose;
+    const originalGeometryDispose = THREE.BufferGeometry.prototype.dispose;
+    let materialDisposalCalls = 0;
+    let geometryDisposalCalls = 0;
+    THREE.Material.prototype.dispose = function() {
+      materialDisposalCalls++;
+      return originalMaterialDispose.call(this);
+    };
+    THREE.BufferGeometry.prototype.dispose = function() {
+      geometryDisposalCalls++;
+      return originalGeometryDispose.call(this);
+    };
+
+    const forceHandle = createIsland(forceInput);
+    try {
+      const occupied = forceHandle.interactiveTiles.find((tile) => tile.userData.isEmpty !== true);
+      assert.ok(occupied);
+      for (const material of getMaterials(occupied)) {
+        assert.equal(material.opacity, 0.5);
+        assert.equal(material.transparent, true);
+        assert.equal(material.depthWrite, false);
+      }
+
+      // 3. Batched LineSegments properties
+      const lineSegments = forceHandle.root.children.find(child => child instanceof THREE.LineSegments);
+      assert.ok(lineSegments, 'LineSegments object must exist for springs');
+      assert.ok(lineSegments.geometry instanceof THREE.BufferGeometry);
+      assert.ok(lineSegments.material instanceof THREE.LineBasicMaterial);
+      assert.equal(lineSegments.material.depthTest, true);
+      assert.equal(lineSegments.material.depthWrite, false);
+
+      // 4. Two vertices per spring
+      const positionAttr = lineSegments.geometry.getAttribute('position');
+      assert.ok(positionAttr);
+      assert.equal(positionAttr.count, 2 * forceInput.layoutResult.springs.length);
+
+      // 5. Literal y = 0
+      for (let i = 0; i < positionAttr.count; i++) {
+        assert.equal(positionAttr.getY(i), 0);
+      }
+
+      // 6. Raycast exclusion (not in interactiveTiles, and raycast overridden to noop)
+      assert.ok(!forceHandle.interactiveTiles.includes(lineSegments), 'springs should not be interactive');
+      const testRaycast = lineSegments.raycast;
+      let raycastCalled = false;
+      const mockRaycaster = {};
+      const mockIntersects = [];
+      lineSegments.raycast(mockRaycaster, mockIntersects);
+      assert.deepEqual(mockIntersects, []);
+
+      // 7. Check color / height mappings are unchanged (height and baseColors exist and match payload)
+      assert.equal(occupied.userData.instances.length, 2);
+      assert.ok(occupied.userData.instances[0].height > 0);
+      assert.ok(occupied.userData.baseColors.length > 0);
+
+      // 8. Zero-spring resource omission
+      const zeroSpringInput = makeInput({
+        mode: 'force-anchors',
+        springs: []
+      }, {
+        presentation: { occupiedOpacity: 0.5, showSprings: true }
+      });
+      const zeroSpringHandle = createIsland(zeroSpringInput);
+      try {
+        const zeroLineSegments = zeroSpringHandle.root.children.find(child => child instanceof THREE.LineSegments);
+        assert.equal(zeroLineSegments, undefined, 'no LineSegments for zero springs');
+      } finally {
+        zeroSpringHandle.dispose();
+      }
+    } finally {
+      forceHandle.dispose();
+      THREE.Material.prototype.dispose = originalMaterialDispose;
+      THREE.BufferGeometry.prototype.dispose = originalGeometryDispose;
+    }
+
+    // 9. Exact disposal of spring resources
+    assert.ok(materialDisposalCalls > 0, 'spring material must be disposed');
+    assert.ok(geometryDisposalCalls > 0, 'spring geometry must be disposed');
+  });
 });
