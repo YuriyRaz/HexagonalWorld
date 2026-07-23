@@ -36,6 +36,7 @@ export function createLayoutRunner({
 
   function runLayout(request) {
     if (request.mode !== 'force-anchors') {
+      cancelActiveLayout('superseded');
       return Promise.resolve(calculateLayout(request));
     }
 
@@ -204,4 +205,3 @@ function validateResult(request, response) {
     throw new Error();
   }
 }
-

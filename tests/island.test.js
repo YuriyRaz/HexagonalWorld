@@ -416,4 +416,53 @@ describe('createIsland object model', () => {
     assert.ok(materialDisposalCalls > 0, 'spring material must be disposed');
     assert.ok(geometryDisposalCalls > 0, 'spring geometry must be disposed');
   });
+
+  test('restores opaque legacy presentation after force candidates and disposes force resources once (T047)', () => {
+    const forceHandle = createIsland(makeInput({
+      mode: 'force-anchors',
+      springs: [makeSpring()],
+    }, {
+      presentation: { occupiedOpacity: 0.5, showSprings: true },
+    }));
+    const legacyHandle = createIsland(makeInput());
+    const forceGeometries = new Set();
+    const forceMaterials = new Set();
+    const geometryDisposals = new Map();
+    const materialDisposals = new Map();
+
+    forceHandle.root.traverse((object) => {
+      if (object.geometry) forceGeometries.add(object.geometry);
+      for (const material of getMaterials(object)) forceMaterials.add(material);
+    });
+    for (const geometry of forceGeometries) {
+      const originalDispose = geometry.dispose.bind(geometry);
+      geometry.dispose = () => {
+        geometryDisposals.set(geometry, (geometryDisposals.get(geometry) ?? 0) + 1);
+        return originalDispose();
+      };
+    }
+    for (const material of forceMaterials) {
+      const originalDispose = material.dispose.bind(material);
+      material.dispose = () => {
+        materialDisposals.set(material, (materialDisposals.get(material) ?? 0) + 1);
+        return originalDispose();
+      };
+    }
+
+    try {
+      const legacyOccupied = legacyHandle.interactiveTiles.find((tile) => tile.userData.isEmpty !== true);
+      assert.ok(legacyOccupied);
+      assert.equal(legacyOccupied.material.opacity, 1);
+      assert.equal(legacyOccupied.material.transparent, false);
+      assert.equal(legacyOccupied.material.depthWrite, true);
+      assert.equal(legacyHandle.root.children.some((child) => child instanceof THREE.LineSegments), false);
+
+      forceHandle.dispose();
+      forceHandle.dispose();
+      assert.ok([...geometryDisposals.values()].every((count) => count === 1));
+      assert.ok([...materialDisposals.values()].every((count) => count === 1));
+    } finally {
+      legacyHandle.dispose();
+    }
+  });
 });

@@ -221,6 +221,29 @@ window.__hexWorldTest = {
       z: inst.z
     }));
   },
+  getRenderSummary: () => {
+    if (!activeIslandHandle) {
+      return {
+        worldChildCount: world.children.length,
+        lineSegments: 0,
+        occupiedOpacity: null,
+        occupiedTransparent: null,
+        occupiedDepthWrite: null,
+      };
+    }
+    const occupied = activeIslandHandle.interactiveTiles.find(t => !t.userData.isEmpty);
+    let lineSegments = 0;
+    activeIslandHandle.root.traverse((child) => {
+      if (child instanceof THREE.LineSegments) lineSegments += 1;
+    });
+    return {
+      worldChildCount: world.children.length,
+      lineSegments,
+      occupiedOpacity: occupied?.material?.opacity ?? null,
+      occupiedTransparent: occupied?.material?.transparent ?? null,
+      occupiedDepthWrite: occupied?.material?.depthWrite ?? null,
+    };
+  },
   projectToScreen: (x, y, z) => {
     const vector = new THREE.Vector3(x, y, z);
     vector.x += 3.3;
@@ -293,6 +316,7 @@ async function rebuildIsland() {
     visualPayloadByEntityId = adapted.visualPayloadByEntityId;
   }
 
+  let candidateHandle = null;
   try {
     const layoutConfig = config.failure 
       ? { __testFailure: config.failure } 
@@ -316,21 +340,28 @@ async function rebuildIsland() {
     if (currentRequestId !== requestIdCounter) return;
 
     const presentation = layoutAlgorithms[algorithmSelect.value];
-    const newHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
-    
-    clearSelection();
-    world.add(newHandle.root);
-    if (activeIslandHandle) {
-      world.remove(activeIslandHandle.root);
-      activeIslandHandle.dispose();
+    candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+    if (currentRequestId !== requestIdCounter) {
+      candidateHandle.dispose();
+      candidateHandle = null;
+      return;
     }
-    
-    activeIslandHandle = newHandle;
+
+    const previousHandle = activeIslandHandle;
+    world.add(candidateHandle.root);
+    activeIslandHandle = candidateHandle;
+    candidateHandle = null;
     activeLayoutResult = layoutResult;
     activeDataSnapshot = currentSchoolData;
     activeVisualPayloadByEntityId = visualPayloadByEntityId;
     tiles = activeIslandHandle.interactiveTiles;
     waterRings = activeIslandHandle.waterRings;
+
+    if (previousHandle) {
+      world.remove(previousHandle.root);
+      previousHandle.dispose();
+    }
+    clearSelection();
     
     fitWorldView(activeIslandHandle.worldSize);
     if (!useTestEntities) {
@@ -349,6 +380,8 @@ async function rebuildIsland() {
     }
     
   } catch (err) {
+    candidateHandle?.dispose();
+    candidateHandle = null;
     console.error('rebuildIsland error:', err);
     if (currentRequestId !== requestIdCounter) return;
     if (err.code !== 'CANCELLED') {

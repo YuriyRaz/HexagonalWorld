@@ -406,6 +406,70 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
     }
   });
 
+  test('restores legacy layouts without stale springs or duplicate roots', { tag: ['@us3'] }, async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    const selector = page.locator('#layout-algorithm');
+    const entities = buildSmallValidHierarchy();
+    const legacyResults = new Map();
+
+    for (const mode of ['flat', 'nested', 'packed']) {
+      await configureNextRequest(page, { entities });
+      await selector.selectOption(mode);
+      await waitForSuccess(page, mode);
+
+      const state = await getState(page);
+      const render = await page.evaluate(() => window.__hexWorldTest.getRenderSummary());
+      legacyResults.set(mode, deterministicResult(state));
+      expect(state.activeResult.springs).toEqual([]);
+      expect(render).toMatchObject({
+        worldChildCount: 1,
+        lineSegments: 0,
+        occupiedOpacity: 1,
+        occupiedTransparent: false,
+        occupiedDepthWrite: true,
+      });
+    }
+
+    const retainedBeforeForce = await getState(page);
+    await configureNextRequest(page, {
+      entities: buildDuplicateIdHierarchy(),
+    });
+    await forceRebuild(page);
+    await expect.poll(async () => (await getState(page)).lastErrorCode).toBe('INVALID_HIERARCHY');
+    const failedBeforeForce = await getState(page);
+    expect(failedBeforeForce.activeRootId).toBe(retainedBeforeForce.activeRootId);
+    expect(failedBeforeForce.activeResult).toEqual(retainedBeforeForce.activeResult);
+
+    await configureNextRequest(page, { entities, delayMs: 120 });
+    await selector.selectOption(FORCE_MODE);
+    await waitForSuccess(page);
+    const forceRender = await page.evaluate(() => window.__hexWorldTest.getRenderSummary());
+    expect(forceRender).toMatchObject({
+      worldChildCount: 1,
+      lineSegments: 1,
+      occupiedOpacity: 0.5,
+      occupiedTransparent: true,
+      occupiedDepthWrite: false,
+    });
+
+    for (const mode of ['flat', 'nested', 'packed']) {
+      await configureNextRequest(page, { entities });
+      await selector.selectOption(mode);
+      await waitForSuccess(page, mode);
+
+      const state = await getState(page);
+      const render = await page.evaluate(() => window.__hexWorldTest.getRenderSummary());
+      expect(deterministicResult(state)).toEqual(legacyResults.get(mode));
+      expect(render.worldChildCount).toBe(1);
+      expect(render.lineSegments).toBe(0);
+      expect(render.occupiedOpacity).toBe(1);
+    }
+
+    expect((await page.evaluate(() => window.__hexWorldTest.getRenderSummary())).worldChildCount).toBe(1);
+  });
+
   test('supports spring rendering and visual presets under visual projects', { tag: ['@us2', '@visual'] }, async ({ page }, testInfo) => {
     const projectName = testInfo.project.name;
     const isVisual = projectName.startsWith('visual-');

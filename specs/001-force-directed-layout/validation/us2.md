@@ -17,6 +17,25 @@ Environment: Playwright 1.61.1, bundled Chromium 149.0.7827.55.
 
 Both projects also passed the zero-spring success case, exact camera application, camera restoration, spring status/accessibility assertions, and predefined 5x5 device-pixel probes.
 
+## Firefox And WebKit Focused Projects
+
+Command:
+
+```text
+npx playwright test tests/app.spec.js --project=visual-desktop-firefox --project=visual-desktop-webkit --project=visual-mobile-firefox --project=visual-mobile-webkit
+```
+
+Environment: Playwright 1.61.1, Firefox 151.0, WebKit 26.5.
+
+| Project | Spring contrast | Hover contrast | Selection contrast | Opaque RGB max diff | Result |
+|---|---:|---:|---:|---:|---|
+| visual-desktop-firefox | 4.0714 | 4.6350 | 4.5037 | 0 | PASS |
+| visual-desktop-webkit | 4.0714 | 4.6350 | 4.5037 | 0 | PASS |
+| visual-mobile-firefox | 4.0511 | 4.6350 | 4.5037 | 0 | PASS |
+| visual-mobile-webkit | 4.0511 | 4.6350 | 4.5037 | 0 | PASS |
+
+All four projects also passed the zero-spring success case, exact camera application, camera restoration, spring status/accessibility assertions, and predefined 5x5 device-pixel probes.
+
 ## Object And Build Checks
 
 | Check | Result |

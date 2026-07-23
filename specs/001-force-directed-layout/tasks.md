@@ -106,11 +106,11 @@ description: "Implementation tasks for the force-directed layout"
 - [X] T038 [P] [US2] Announce virtual-anchor grouping, active spring count or zero-spring success, and tower transparency in algorithm/status/canvas accessibility text after T024 and T036 in `src/main.js`
 - [X] T039 [P] [US2] Preserve readable note/status presentation and focus/selection cues for translucent towers across the desktop and mobile visual viewports after T025 and T036 in `src/style.css`
 - [X] T040 [US2] Run `visual-desktop-chromium` at 1440x900/DPR 1/FOV 34/target control-spring midpoint at `y=0`/azimuth 32/elevation 30/distance 43; execute every 5x5 device-pixel 3:1 visible/hover/selection probe and every at-most-5-RGB opaque-control comparison; record raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
-- [ ] T041 [US2] After T040, run the identical desktop camera and pixel-probe assertions in `visual-desktop-firefox` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
-- [ ] T042 [US2] After T041, run the identical desktop camera and pixel-probe assertions in `visual-desktop-webkit` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
+- [X] T041 [US2] After T040, run the identical desktop camera and pixel-probe assertions in `visual-desktop-firefox` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
+- [X] T042 [US2] After T041, run the identical desktop camera and pixel-probe assertions in `visual-desktop-webkit` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
 - [X] T043 [US2] After T042, run `visual-mobile-chromium` at 390x844/DPR 3/FOV 34/target control-spring midpoint at `y=0`/azimuth 32/elevation 30/distance 72; execute every 5x5 device-pixel 3:1 visible/hover/selection probe and every at-most-5-RGB opaque-control comparison; append raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
-- [ ] T044 [US2] After T043, run the identical mobile camera and pixel-probe assertions in `visual-mobile-firefox` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
-- [ ] T045 [US2] After T044, run the identical mobile camera and pixel-probe assertions in `visual-mobile-webkit` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
+- [X] T044 [US2] After T043, run the identical mobile camera and pixel-probe assertions in `visual-mobile-firefox` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
+- [X] T045 [US2] After T044, run the identical mobile camera and pixel-probe assertions in `visual-mobile-webkit` and append engine revision, raw probe results, object invariants, and camera restoration in `specs/001-force-directed-layout/validation/us2.md`
 - [ ] T046 [US2] After T037-T045 and a successful `npm run build`, execute SC-007 with exactly ten first-time participants using the fixed unprompted identify-and-trace task, and record build ID, anonymous pass/fail totals, and the required at-least-9-of-10 result in `specs/001-force-directed-layout/validation/usability.md`
 
 **Checkpoint**: US2 passes object contracts and all six exact camera-preset visual projects.
@@ -125,14 +125,14 @@ description: "Implementation tasks for the force-directed layout"
 
 ### Validation for User Story 3
 
-- [ ] T047 [P] [US3] After T035, extend and observe failing island tests for opaque legacy materials after force candidates, zero legacy spring resources, factory-exception cleanup, idempotent candidate disposal, and exactly-once replacement disposal in `tests/island.test.js`
-- [ ] T048 [US3] After T036, extend and observe failing browser scenarios for force-to-flat/nested/packed switching, rapid mixed-mode selection, silent worker cancellation, unchanged legacy placements/styles/statistics, retained-world failures, and no duplicate scene objects in `tests/app.spec.js`
+- [X] T047 [P] [US3] After T035, extend and observe failing island tests for opaque legacy materials after force candidates, zero legacy spring resources, factory-exception cleanup, idempotent candidate disposal, and exactly-once replacement disposal in `tests/island.test.js`
+- [X] T048 [US3] After T036, extend and observe failing browser scenarios for force-to-flat/nested/packed switching, rapid mixed-mode selection, silent worker cancellation, unchanged legacy placements/styles/statistics, retained-world failures, and no duplicate scene objects in `tests/app.spec.js`
 
 ### Implementation for User Story 3
 
-- [ ] T049 [P] [US3] Harden island candidate ownership transfer, partial-factory cleanup, force-to-legacy material restoration, and idempotent replacement disposal after T037 and T047 in `src/island.js`
-- [ ] T050 [P] [US3] Finalize mixed synchronous/worker cancellation, stale-candidate disposal, interaction-reference rollback/swap, selection restoration, and legacy summary restoration after T038 and T048 in `src/main.js`
-- [ ] T051 [US3] Run repeated force-to-flat/nested/packed switching and failure recovery, then record scene-object counts, worker/island disposal evidence, and legacy regression outcomes in `specs/001-force-directed-layout/validation/us3.md`
+- [X] T049 [P] [US3] Harden island candidate ownership transfer, partial-factory cleanup, force-to-legacy material restoration, and idempotent replacement disposal after T037 and T047 in `src/island.js`
+- [X] T050 [P] [US3] Finalize mixed synchronous/worker cancellation, stale-candidate disposal, interaction-reference rollback/swap, selection restoration, and legacy summary restoration after T038 and T048 in `src/main.js`
+- [X] T051 [US3] Run repeated force-to-flat/nested/packed switching and failure recovery, then record scene-object counts, worker/island disposal evidence, and legacy regression outcomes in `specs/001-force-directed-layout/validation/us3.md`
 
 **Checkpoint**: US3 leaves exactly one current world with no stale force presentation or resources.
 
