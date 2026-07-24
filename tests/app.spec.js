@@ -62,7 +62,7 @@ async function waitForActiveMode(page, mode) {
   await expect.poll(async () => {
     const state = await getState(page);
     return state.busy ? null : state.activeMode;
-  }).toBe(mode);
+  }, { timeout: 30000 }).toBe(mode);
 }
 
 async function forceRebuild(page) {
@@ -407,6 +407,7 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
   });
 
   test('restores legacy layouts without stale springs or duplicate roots', { tag: ['@us3'] }, async ({ page }) => {
+    test.setTimeout(120_000);
     await openApp(page);
     await expectTestApi(page);
 

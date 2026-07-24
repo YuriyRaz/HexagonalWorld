@@ -64,3 +64,29 @@ Open the local URL printed by Vite.
 
 - [Three.js](https://threejs.org/)
 - [Vite](https://vite.dev/)
+
+## Force-Directed Layout Architecture
+
+### Overview
+This feature introduces a selectable `force-anchors` mode using `d3-force` running in a dedicated module worker. The layout is calculated off the main thread to ensure continuous responsiveness.
+
+### Architecture Boundaries & File Roles
+- `src/hex.js`: Centralizes axial helpers, rounding, distance, spiral coordinate systems, and pointy-top axial-to-plane projections.
+- `src/data.js`: Validates input hierarchies and transforms them into domain-neutral entities.
+- `src/layout.js`: Handles legacy layouts, mode metadata, and common result statistics.
+- `src/force-layout.js`: Sets up the Mulberry32 random generator, linear alpha decay schedules, virtual anchors, immediate-parent links, and custom hex-assignment force for stable placement.
+- `src/layout-worker.js`: Module-worker entry point managing calculate requests and structured-cloneable error/success transport.
+- `src/layout-runner.js`: Manages async worker promise resolution, terminators, silent cancellations, and the 60,000ms production safety hang-guard.
+- `src/island.js`: Three.js rendering manager. Sets tower transparency to 50% in force mode, batches debug spring lines at `y = 0`, disables depth-writes for transparent items, and handles idempotent disposal of GPU assets.
+- `src/main.js`: Main coordinator orchestrating user inputs, selection status announcements, calculating state alerts, and transactional commits of candidate islands.
+
+### Controls & Accessibility
+- Native select elements are keyboard and touch accessible.
+- Calculator busy states set `aria-busy="true"` on the form.
+- The UI remains readable and reachable at mobile viewports down to 360px CSS width and short screen heights.
+
+### Testing and Validation
+Run unit tests, browser tests, and benchmarks using the following scripts:
+- `npm test`: Node.js unit tests for pure layout, worker serialization, and geometry helpers.
+- `npm run test:e2e`: E2E validation of app interaction, error handling, visual contrast, camera presets, and responsive behavior.
+- `npm run benchmark:layout`: Performance benchmarks evaluating warmups, completion latency, Tab response times, and post-commit frame rates.

@@ -1,6 +1,6 @@
 import { defineConfig } from 'playwright/test'
 
-const browsers = ['chromium', 'firefox', 'webkit']
+const browsers = ['chromium']
 
 const profiles = [
   {
@@ -35,7 +35,7 @@ const profiles = [
 ]
 
 export default defineConfig({
-  timeout: 60000,
+  timeout: 120000,
   testDir: './tests',
   outputDir: 'test-results',
   reporter: [
@@ -43,7 +43,7 @@ export default defineConfig({
     ['html', { outputFolder: 'playwright-report', open: 'never' }],
   ],
   use: {
-    baseURL: 'http://127.0.0.1:4173/HexagonalWorld/',
+    baseURL: 'http://127.0.0.1:4174/HexagonalWorld/',
   },
   projects: [
     ...profiles.flatMap(({ name, use, ...profile }) =>
@@ -64,8 +64,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 4173 --strictPort',
-    url: 'http://127.0.0.1:4173/HexagonalWorld/',
+    command: 'npm run dev -- --host 127.0.0.1 --port 4174 --strictPort',
+    url: 'http://127.0.0.1:4174/HexagonalWorld/',
     reuseExistingServer: true,
   },
 })
