@@ -159,8 +159,8 @@ export function calculateForceLayout(request) {
       y: pos.z,
       vx: 0,
       vy: 0,
-      fx: null,
-      fy: null,
+      fx: pos.x,
+      fy: pos.z,
       cellQ: placement.q,
       cellR: placement.r,
     };
@@ -220,14 +220,15 @@ export function calculateForceLayout(request) {
     }
   }
 
+  const leafLinkStrength = request.config.linkStrength * 4;
   const simulation = forceSimulation(allNodes)
     .force('link', forceLink(links)
       .id(d => d.entityId)
       .distance(request.config.linkDistance)
-      .strength(request.config.linkStrength)
+      .strength(d => d.source.kind === 'leaf' ? leafLinkStrength : request.config.linkStrength)
       .iterations(request.config.linkIterations))
     .force('manyBody', forceManyBody()
-      .strength(request.config.manyBodyStrength)
+      .strength(d => d.kind === 'leaf' ? 0 : request.config.manyBodyStrength)
       .theta(request.config.manyBodyTheta)
       .distanceMin(request.config.manyBodyDistanceMin)
       .distanceMax(request.config.manyBodyDistanceMax))

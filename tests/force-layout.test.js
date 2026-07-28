@@ -555,4 +555,56 @@ describe('deterministic simulation contract', () => {
 
     for (const result of results.slice(1)) assert.deepEqual(result, results[0]);
   });
+
+  test('keeps every anchor within 5 hex cells of its children centroid', () => {
+    const entities = buildGroupingHierarchy();
+    const result = calculateForceLayout(makeRequest(entities));
+    const { leaves, internals } = hierarchyFacts(entities);
+    const entityById = new Map(entities.map(e => [e.id, e]));
+    const placementById = new Map(result.placements.map(p => [p.entityId, p]));
+    const springTargetByEntityId = new Map();
+    for (const spring of result.springs) {
+      if (spring.target.kind === 'anchor' && !springTargetByEntityId.has(spring.target.entityId)) {
+        springTargetByEntityId.set(spring.target.entityId, spring.target);
+      }
+    }
+
+    const MAX_ANCHOR_DISTANCE = 5;
+    for (const internal of internals) {
+      const childLeaves = leaves.filter(l => entityById.get(l.id)?.parentId === internal.id);
+      if (childLeaves.length === 0) continue;
+      let sumQ = 0, sumR = 0;
+      for (const leaf of childLeaves) {
+        const p = placementById.get(leaf.id);
+        sumQ += p.q;
+        sumR += p.r;
+      }
+      const centroidQ = sumQ / childLeaves.length;
+      const centroidR = sumR / childLeaves.length;
+      const target = springTargetByEntityId.get(internal.id);
+      assert.ok(target, `anchor ${internal.id} must have a spring target`);
+      const dist = axialDistance({ q: centroidQ, r: centroidR }, { q: target.q, r: target.r });
+      assert.ok(
+        dist <= MAX_ANCHOR_DISTANCE,
+        `anchor ${internal.id} at (${target.q},${target.r}) is ${dist.toFixed(2)} hex cells from children centroid (${centroidQ.toFixed(2)},${centroidR.toFixed(2)}), must be <= ${MAX_ANCHOR_DISTANCE}`,
+      );
+    }
+  });
+
+  test('keeps every spring shorter than 15 hex cells', () => {
+    const entities = buildGroupingHierarchy();
+    const result = calculateForceLayout(makeRequest(entities));
+    const MAX_SPRING_LENGTH = 15;
+    for (let i = 0; i < result.springs.length; i++) {
+      const spring = result.springs[i];
+      const dist = axialDistance(
+        { q: spring.source.q, r: spring.source.r },
+        { q: spring.target.q, r: spring.target.r },
+      );
+      assert.ok(
+        dist <= MAX_SPRING_LENGTH,
+        `spring ${i} (${spring.source.entityId} -> ${spring.target.entityId}) is ${dist.toFixed(2)} hex cells long, must be <= ${MAX_SPRING_LENGTH}`,
+      );
+    }
+  });
 });
