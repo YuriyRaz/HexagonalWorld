@@ -287,7 +287,195 @@ function smoothNoise(q, r) {
   ) * 0.11;
 }
 
+function validateForceTopology(topology, terminalFrame, layoutResult, visualPayloadByEntityId) {
+  if (!isRecord(topology) || !Array.isArray(topology.nodeIds) || !Array.isArray(topology.nodeKinds) || !Array.isArray(topology.relations)) {
+    failValidation('INVALID_FORCE_TOPOLOGY');
+  }
+  if (topology.nodeIds.length === 0 || topology.nodeIds.length !== topology.nodeKinds.length) failValidation('INVALID_FORCE_TOPOLOGY');
+  if (!terminalFrame || !(terminalFrame.positions instanceof Float32Array) || terminalFrame.positions.length !== topology.nodeIds.length * 2) failValidation('INVALID_TERMINAL_FRAME');
+  if (!layoutResult || layoutResult.mode !== 'force-anchors') failValidation('INVALID_FORCE_LAYOUT_RESULT');
+  const leaves = topology.nodeIds.filter((_, index) => topology.nodeKinds[index] === 'leaf');
+  if (layoutResult.placements.length !== leaves.length || visualPayloadByEntityId.size !== leaves.length) failValidation('INVALID_FORCE_PLACEMENTS');
+  const leafIds = new Set(leaves);
+  const cells = new Set();
+  for (const placement of layoutResult.placements) {
+    if (!leafIds.has(placement.entityId) || !Number.isSafeInteger(placement.q) || !Number.isSafeInteger(placement.r)) failValidation('INVALID_FORCE_PLACEMENT');
+    const key = `${placement.q},${placement.r}`;
+    if (cells.has(key)) failValidation('DUPLICATE_FORCE_CELL');
+    cells.add(key);
+    if (!visualPayloadByEntityId.has(placement.entityId)) failValidation('MISSING_VISUAL_PAYLOAD', { entityId: placement.entityId });
+    const nodeIndex = topology.nodeIds.indexOf(placement.entityId);
+    const center = axialToPlane(placement.q, placement.r);
+    if (nodeIndex < 0 || terminalFrame.positions[nodeIndex * 2] !== Math.fround(center.x) || terminalFrame.positions[nodeIndex * 2 + 1] !== Math.fround(center.z)) {
+      failValidation('TERMINAL_CENTER_MISMATCH', { entityId: placement.entityId });
+    }
+  }
+  for (const relation of topology.relations) {
+    if (!Number.isSafeInteger(relation.sourceIndex) || !Number.isSafeInteger(relation.targetIndex) || relation.sourceIndex < 0 || relation.targetIndex < 0 || relation.sourceIndex >= topology.nodeIds.length || relation.targetIndex >= topology.nodeIds.length) failValidation('INVALID_FORCE_RELATION');
+  }
+}
+
+function createForceIsland(input, stable) {
+  const {
+    visualPayloadByEntityId,
+    topology,
+    initialFrame,
+    terminalFrame = initialFrame,
+    layoutResult = null,
+    presentation = { occupiedOpacity: 0.5, showSprings: true },
+  } = input;
+  if (!(visualPayloadByEntityId instanceof Map)) failValidation('INVALID_PAYLOAD_MAP');
+  if (!isRecord(presentation) || typeof presentation.showSprings !== 'boolean' || !Number.isFinite(presentation.occupiedOpacity)) failValidation('INVALID_PRESENTATION');
+  if (stable) validateForceTopology(topology, terminalFrame, layoutResult, visualPayloadByEntityId);
+  else {
+    if (!isRecord(topology) || !Array.isArray(topology.nodeIds) || !Array.isArray(topology.nodeKinds) || !Array.isArray(topology.relations)) failValidation('INVALID_FORCE_TOPOLOGY');
+    if (!initialFrame || !(initialFrame.positions instanceof Float32Array) || initialFrame.positions.length !== topology.nodeIds.length * 2) failValidation('INVALID_INITIAL_FRAME');
+  }
+
+  const ownership = createOwnershipLedger();
+  const root = ownership.ownObject(new THREE.Group());
+  const leafIndices = [];
+  for (let index = 0; index < topology.nodeIds.length; index += 1) {
+    if (topology.nodeKinds[index] === 'leaf') leafIndices.push(index);
+  }
+  const occupiedGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, 1, 6, 1, false));
+  const translucent = presentation.occupiedOpacity < 1;
+  const occupiedMaterial = ownership.ownMaterial(new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.84,
+    metalness: 0.02,
+    flatShading: true,
+    opacity: presentation.occupiedOpacity,
+    transparent: translucent,
+    depthWrite: !translucent,
+    fog: !translucent,
+    toneMapped: !translucent,
+  }));
+  const occupiedTiles = ownership.ownObject(new THREE.InstancedMesh(occupiedGeometry, occupiedMaterial, leafIndices.length));
+  const instances = new Array(leafIndices.length);
+  const baseColors = new Float32Array(leafIndices.length * 3);
+  const matrix = new THREE.Matrix4();
+  const position = new THREE.Vector3();
+  const scale = new THREE.Vector3();
+  const rotation = new THREE.Quaternion();
+  const color = new THREE.Color();
+  let worldSize = 18;
+  const getHeight = (entityId, index) => {
+    const payload = validatePayload(visualPayloadByEntityId.get(entityId), entityId);
+    const normalizedHeight = Math.min(100, Math.max(0, payload.heightValue)) / 100;
+    const height = MIN_TILE_HEIGHT + normalizedHeight * (MAX_TILE_HEIGHT - MIN_TILE_HEIGHT);
+    color.set(COLOR_PALETTE[payload.colorGroupOrder % COLOR_PALETTE.length]);
+    return { payload: payload.payload, height, colorIndex: index };
+  };
+  const applyPosition = (frame, updateBounds = true) => {
+    if (!(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2) throw renderFailure('INVALID_FORCE_FRAME');
+    const next = new Array(leafIndices.length);
+    for (let index = 0; index < leafIndices.length; index += 1) {
+      const nodeIndex = leafIndices[index];
+      const x = frame.positions[nodeIndex * 2];
+      const z = frame.positions[nodeIndex * 2 + 1];
+      if (!Number.isFinite(x) || !Number.isFinite(z)) throw renderFailure('NONFINITE_FORCE_FRAME');
+      const entityId = topology.nodeIds[nodeIndex];
+      const record = instances[index] || getHeight(entityId, index);
+      next[index] = { x, z, record };
+    }
+    for (let index = 0; index < next.length; index += 1) {
+      const { x, z, record } = next[index];
+      const depth = record.height + 1.4;
+      const y = record.height / 2 - 0.62;
+      position.set(x, y, z);
+      scale.set(1, depth, 1);
+      matrix.compose(position, rotation, scale);
+      occupiedTiles.setMatrixAt(index, matrix);
+      color.set(COLOR_PALETTE[record.payload.colorGroupOrder % COLOR_PALETTE.length]);
+      occupiedTiles.setColorAt(index, color);
+      color.toArray(baseColors, index * 3);
+      if (!instances[index]) instances[index] = { entityId: topology.nodeIds[leafIndices[index]], payload: record.payload, x, y, z, depth, height: record.height };
+      else Object.assign(instances[index], { x, y, z, depth });
+      if (updateBounds) worldSize = Math.max(worldSize, Math.hypot(x, z) + HEX_SIZE * 2);
+    }
+    occupiedTiles.userData = { instances, baseColors, nodeIndices: leafIndices };
+    occupiedTiles.instanceMatrix.needsUpdate = true;
+    if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
+  };
+  applyPosition(stable ? terminalFrame : initialFrame);
+  occupiedTiles.castShadow = leafIndices.length <= 2500;
+  occupiedTiles.receiveShadow = true;
+  occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  occupiedTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
+  occupiedTiles.computeBoundingSphere();
+  root.add(occupiedTiles);
+
+  const springPositions = new Float32Array(topology.relations.length * 6);
+  const springGeometry = ownership.ownGeometry(new THREE.BufferGeometry());
+  springGeometry.setAttribute('position', new THREE.BufferAttribute(springPositions, 3));
+  const springMaterial = ownership.ownMaterial(new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: true, depthWrite: false, transparent: true, opacity: 1, fog: false }));
+  const springs = topology.relations.length > 0 ? ownership.ownObject(new THREE.LineSegments(springGeometry, springMaterial)) : null;
+  if (springs) {
+    springs.raycast = () => {};
+    root.add(springs);
+  }
+  const updateSprings = (frame) => {
+    if (!springs) return;
+    for (let index = 0; index < topology.relations.length; index += 1) {
+      const relation = topology.relations[index];
+      const source = relation.sourceIndex * 2;
+      const target = relation.targetIndex * 2;
+      springPositions[index * 6] = frame.positions[source];
+      springPositions[index * 6 + 1] = 0;
+      springPositions[index * 6 + 2] = frame.positions[source + 1];
+      springPositions[index * 6 + 3] = frame.positions[target];
+      springPositions[index * 6 + 4] = 0;
+      springPositions[index * 6 + 5] = frame.positions[target + 1];
+    }
+    springGeometry.attributes.position.needsUpdate = true;
+    springGeometry.computeBoundingSphere();
+    springGeometry.computeBoundingBox();
+  };
+  updateSprings(stable ? terminalFrame : initialFrame);
+  let lastGlobalStep = stable ? terminalFrame.globalStep : initialFrame.globalStep;
+  let retired = false;
+  return {
+    requestId: topology.requestId,
+    root,
+    interactiveTiles: [occupiedTiles],
+    applyStep(frame) {
+      if (retired) throw renderFailure('RETIRED_ISLAND');
+      if (frame.requestId !== topology.requestId || frame.globalStep !== lastGlobalStep + 1) throw renderFailure('INVALID_FORCE_STEP', { expected: lastGlobalStep + 1, actual: frame.globalStep });
+      // Validate every coordinate before changing either geometry buffer.
+      for (const value of frame.positions) if (!Number.isFinite(value)) throw renderFailure('NONFINITE_FORCE_FRAME');
+      applyPosition(frame);
+      updateSprings(frame);
+      lastGlobalStep = frame.globalStep;
+    },
+    inspectCurrentFrame() {
+      return {
+        requestId: topology.requestId,
+        globalStep: lastGlobalStep,
+        positions: leafIndices.flatMap((nodeIndex) => [instances[leafIndices.indexOf(nodeIndex)].x, instances[leafIndices.indexOf(nodeIndex)].z]),
+        springPositions: springs ? Array.from(springPositions) : [],
+      };
+    },
+    retire() {
+      retired = true;
+      root.removeFromParent();
+    },
+    dispose() {
+      if (!retired) retired = true;
+      ownership.dispose();
+    },
+    stats: layoutResult?.stats ?? { occupiedCount: leafIndices.length, boundaryGaps: [] },
+    worldSize,
+    terminalFrame: stable ? terminalFrame : null,
+  };
+}
+
+export function createLiveIsland(input) {
+  return createForceIsland(input, false);
+}
+
 export function createIsland(input) {
+  if (input?.topology && input?.terminalFrame) return createForceIsland(input, true);
   const validated = validateInput(input);
   const { presentation } = input;
   const ownership = createOwnershipLedger();

@@ -13,6 +13,8 @@ The current version is a visual prototype built around a procedurally generated 
 - Orbit, pan, and zoom camera controls
 - Responsive information panel for the selected entity
 - Real-time lighting, shadows, fog, water, and ambient effects
+- Realtime force evolution with visible step-0, assignments, anchors, and relationship springs
+- Deterministic exact-center terminal frames and retained worker sessions for future controls
 
 ## Project Direction
 
@@ -39,6 +41,8 @@ Open the local URL printed by Vite.
 | `npm run dev` | Start the development server |
 | `npm run build` | Create a production build in `dist/` |
 | `npm run preview` | Preview the production build locally |
+| `npm run test:e2e` | Run desktop, local phone-emulation, and tablet-emulation Chromium journeys |
+| `npm run benchmark:layout` | Run the local desktop/phone/tablet benchmark projects |
 
 ## Controls
 
@@ -71,22 +75,28 @@ Open the local URL printed by Vite.
 This feature introduces a selectable `force-anchors` mode using `d3-force` running in a dedicated module worker. The layout is calculated off the main thread to ensure continuous responsiveness.
 
 ### Architecture Boundaries & File Roles
-- `src/hex.js`: Centralizes axial helpers, rounding, distance, spiral coordinate systems, and pointy-top axial-to-plane projections.
+- `src/hex.js`: Centralizes axial helpers, rounding, distance, spiral coordinate systems, and both pointy-top plane transforms.
 - `src/data.js`: Validates input hierarchies and transforms them into domain-neutral entities.
 - `src/layout.js`: Handles legacy layouts, mode metadata, and common result statistics.
-- `src/force-layout.js`: Sets up the Mulberry32 random generator, linear alpha decay schedules, virtual anchors, immediate-parent links, and custom hex-assignment force for stable placement.
-- `src/layout-worker.js`: Module-worker entry point managing calculate requests and structured-cloneable error/success transport.
-- `src/layout-runner.js`: Manages async worker promise resolution, terminators, silent cancellations, and the 60,000ms production safety hang-guard.
-- `src/island.js`: Three.js rendering manager. Sets tower transparency to 50% in force mode, batches debug spring lines at `y = 0`, disables depth-writes for transparent items, and handles idempotent disposal of GPU assets.
-- `src/main.js`: Main coordinator orchestrating user inputs, selection status announcements, calculating state alerts, and transactional commits of candidate islands.
+- `src/force-layout.js`: Owns the deterministic version-2 session, evolving unique assignments, in-tick center locks, exact terminal serialization, and the request-scoped fix/release seam.
+- `src/layout-worker.js`: Module-worker state machine that gates every normal-motion step on the exact returned paint buffer and retains successful sessions inertly.
+- `src/layout-runner.js`: Validates topology, frame order, terminal equality, callbacks, commit handshakes, control sequencing, and request lifecycle ownership.
+- `src/island.js`: Owns detached live/stable force islands with one reusable tower mesh and spring buffer; terminal transforms consume direct Float32 frame coordinates.
+- `src/main.js`: Coordinates RAF paint receipts, non-live progress, reduced-motion final-only presentation, rollback-safe commits, and existing camera/selection semantics.
 
 ### Controls & Accessibility
 - Native select elements are keyboard and touch accessible.
 - Calculator busy states set `aria-busy="true"` on the form.
+- Force progress is visible but `aria-live="off"`; only calculation start and terminal status are announced.
+- Moving lines are explicitly described as force relationships influencing layout, and terminal status names the final step.
 - The UI remains readable and reachable at mobile viewports down to 360px CSS width and short screen heights.
+
+The retained session is intentionally not connected to pointer, touch, keyboard, selection, camera, or accessibility gestures. Click still selects a tower and existing OrbitControls gestures still control the camera.
 
 ### Testing and Validation
 Run unit tests, browser tests, and benchmarks using the following scripts:
-- `npm test`: Node.js unit tests for pure layout, worker serialization, and geometry helpers.
-- `npm run test:e2e`: E2E validation of app interaction, error handling, visual contrast, camera presets, and responsive behavior.
-- `npm run benchmark:layout`: Performance benchmarks evaluating warmups, completion latency, Tab response times, and post-commit frame rates.
+- `npm test`: Node.js unit tests for pure layout, version-2 sessions, command epochs, worker serialization, and geometry helpers.
+- `npm run test:e2e`: E2E validation of every-step presentation, error handling, reduced motion, camera/selection semantics, and responsive local Chromium profiles.
+- `npm run benchmark:layout`: Performance benchmarks across 1024x720 desktop, 360x800 phone touch emulation, and 768x1024 tablet touch emulation.
+
+Phone and tablet evidence is local Chromium viewport/touch emulation only. It is not native Android, native browser, hardware, or assistive-technology evidence.

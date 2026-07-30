@@ -12,6 +12,8 @@ export const HEX_DIRECTIONS = Object.freeze([
 const DEFAULT_QUANTIZATION_STEP = 0.000001;
 const SQRT_3 = Math.sqrt(3);
 
+export const ADJACENT_CELL_SPACING = HEX_SIZE * SQRT_3;
+
 function assertFinite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite.`);
 }
@@ -175,4 +177,20 @@ export function axialToPlane(q, r) {
     x: normalizeZero(HEX_SIZE * SQRT_3 * (q + r / 2)),
     z: normalizeZero(HEX_SIZE * 1.5 * r),
   };
+}
+
+/** Convert the pointy-top simulation plane back to fractional axial space. */
+export function planeToAxial(x, z) {
+  assertFinite(x, 'x');
+  assertFinite(z, 'z');
+  return {
+    q: x / (HEX_SIZE * SQRT_3) - z / (HEX_SIZE * 3),
+    r: z / (HEX_SIZE * 1.5),
+  };
+}
+
+export function fractionalAxialRadius(q, r) {
+  assertFinite(q, 'q');
+  assertFinite(r, 'r');
+  return Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
 }

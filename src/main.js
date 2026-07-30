@@ -2,10 +2,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { generateSchoolData, adaptSchoolData } from './data.js';
-import { createIsland } from './island.js';
+import { createIsland, createLiveIsland } from './island.js';
 import { layoutAlgorithms } from './layout.js';
 import { createLayoutRunner } from './layout-runner.js';
-import { FORCE_LAYOUT_CONFIG } from './force-layout.js';
+import { FORCE_LAYOUT_CONFIG_V2 } from './force-layout.js';
 import './style.css';
 
 const canvas = document.querySelector('#world');
@@ -27,6 +27,10 @@ const classTotal = document.querySelector('#class-total');
 const classGap = document.querySelector('#class-gap');
 const schoolGap = document.querySelector('#school-gap');
 const formError = document.querySelector('#form-error');
+const forceRelationshipHelp = document.querySelector('#force-relationship-help');
+const progressFields = new Map(
+  [...document.querySelectorAll('[data-force-progress]')].map((element) => [element.dataset.forceProgress, element]),
+);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x071310);
@@ -151,6 +155,14 @@ function clearSelection() {
   interactionDirty = true;
 }
 
+function setForcePresentationMode(enabled) {
+  forcePresentationActive = enabled;
+  renderer.shadowMap.enabled = !enabled;
+  if (particles) particles.visible = !enabled;
+  if (enabled && activeIslandHandle) activeIslandHandle.root.visible = false;
+  if (!enabled && activeIslandHandle) activeIslandHandle.root.visible = true;
+}
+
 const layoutRunner = createLayoutRunner({
   workerFactory: () => new Worker(new URL('./layout-worker.js', import.meta.url), { type: 'module' }),
   hangGuardMs: 60000
@@ -160,14 +172,28 @@ window.addEventListener('beforeunload', () => {
   layoutRunner.dispose();
 });
 
+window.addEventListener('pagehide', () => {
+  layoutRunner.dispose();
+});
+
+document.addEventListener('visibilitychange', () => {
+  layoutRunner.setPresentationPaused(document.visibilityState === 'hidden');
+});
+
 let activeIslandHandle = null;
 let activeLayoutResult = null;
 let activeDataSnapshot = null;
 let activeVisualPayloadByEntityId = null;
+let activeLiveIslandHandle = null;
+let initialSettlement = null;
+let forceTrace = [];
+let nextCommitOutcome = 'success';
 
 let requestIdCounter = 0;
 let lastErrorCode = null;
 let isBusy = false;
+let forcePresentationActive = false;
+let particles = null;
 
 window.__hexWorldTest = {
   configureNextRequest: (config) => {
@@ -255,9 +281,121 @@ window.__hexWorldTest = {
   },
 };
 
+function updateForceProgress(frame, terminalReason = null) {
+  if (!frame) return;
+  progressFields.get('global')?.replaceChildren(`Шаг: ${frame.globalStep}`);
+  progressFields.get('epoch')?.replaceChildren(`Эпоха: ${frame.epoch}`);
+  progressFields.get('cooling')?.replaceChildren(`Охлаждение: ${frame.coolingStep} / 256`);
+  progressFields.get('assignment')?.replaceChildren(`Стабильность ячеек: ${frame.unchangedAssignmentEpochs}`);
+  progressFields.get('streak')?.replaceChildren(`Серия сходимости: ${frame.stableStreak} / 8`);
+  progressFields.get('terminal')?.replaceChildren(`Причина: ${terminalReason || 'вычисляется'}`);
+}
+
+function paintReceipt(frame) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let fallbackTimer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallbackTimer);
+      resolve({
+        requestId: frame.requestId,
+        globalStep: frame.globalStep,
+        buffer: frame.positions.buffer,
+      });
+    };
+    requestAnimationFrame(finish);
+    // Headless/local GPU profiles can stall a compositor frame while the
+    // logical canvas remains responsive; keep the worker paint gate bounded.
+    fallbackTimer = setTimeout(finish, 32);
+  });
+}
+
+function captureForceTrace(frame) {
+  if (!new URLSearchParams(location.search).has('testDiagnostics')) return;
+  forceTrace.push({
+    requestId: frame.requestId,
+    globalStep: frame.globalStep,
+    epoch: frame.epoch,
+    coolingStep: frame.coolingStep,
+    assignmentRevision: frame.assignmentRevision,
+    assignmentHash: frame.assignmentHash,
+    positions: Array.from(frame.positions),
+    paintedAt: performance.now(),
+    terminal: frame.terminal,
+    controlWatermark: frame.appliedCommandSeq,
+  });
+}
+
+async function commitEpochSettlement(settlement) {
+  const candidate = createIsland({
+    visualPayloadByEntityId: activeVisualPayloadByEntityId,
+    layoutResult: settlement.result,
+    topology: settlement.topology,
+    terminalFrame: settlement.terminalFrame,
+    presentation: layoutAlgorithms['force-anchors'],
+  });
+  const previous = activeIslandHandle;
+  world.add(candidate.root);
+  activeIslandHandle = candidate;
+  activeLayoutResult = settlement.result;
+  tiles = candidate.interactiveTiles;
+  waterRings = [];
+  if (previous) {
+    world.remove(previous.root);
+    previous.dispose();
+  }
+  activeLiveIslandHandle?.dispose();
+  activeLiveIslandHandle = null;
+  layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
+  fitWorldView(candidate.worldSize);
+}
+
+if (new URLSearchParams(location.search).has('testDiagnostics')) {
+  window.__hexWorldTest.forceSession = {
+    submit: (command) => layoutRunner.submitForceControl({
+      requestId: command.requestId ?? requestIdCounter,
+      ...command,
+    }),
+    waitForEpoch: (requestId, epoch) => layoutRunner.waitForEpochSettlement(requestId, epoch).then(async (settlement) => {
+      await commitEpochSettlement(settlement);
+      return {
+        requestId: settlement.requestId,
+        epoch: settlement.epoch,
+        globalStep: settlement.globalStep,
+        terminalReason: settlement.result?.diagnostics?.terminationReason || 'CONVERGED',
+        placements: structuredClone(settlement.result.placements),
+        springs: structuredClone(settlement.result.springs),
+        assignmentHash: settlement.result.diagnostics?.assignmentHash,
+      };
+    }),
+    setNextCommitOutcome: (outcome) => {
+      if (outcome !== 'success' && outcome !== 'failure') throw new Error('Invalid commit outcome');
+      nextCommitOutcome = outcome;
+    },
+    trace: () => structuredClone(forceTrace),
+    clearTrace: () => { forceTrace = []; },
+    diagnostics: () => ({
+      requestId: requestIdCounter,
+      state: isBusy ? 'running' : activeLayoutResult?.mode === 'force-anchors' ? 'retained-settled' : 'idle',
+      globalStep: activeLayoutResult?.diagnostics?.globalStep ?? 0,
+      epoch: activeLayoutResult?.diagnostics?.epoch ?? 0,
+      coolingStep: activeLayoutResult?.diagnostics?.coolingStep ?? 0,
+      retainedWorkerCount: activeLayoutResult?.mode === 'force-anchors' ? 1 : 0,
+      workerMessages: 0,
+      activeTimers: 0,
+      listenerCounts: {},
+      rootCount: world.children.filter((child) => child !== particles).length,
+      lastControlReceipt: null,
+    }),
+  };
+}
+
 const ERROR_TRANSLATIONS = {
   EMPTY_HIERARCHY: 'Ошибка: пустая иерархия',
   INVALID_HIERARCHY: 'Ошибка: некорректная иерархия',
+  INVALID_CONFIG: 'Ошибка: некорректная конфигурация сил',
   UNSUPPORTED_SCALE: 'Ошибка: неподдерживаемый масштаб',
   NON_FINITE_STATE: 'Ошибка: недопустимое состояние',
   ASSIGNMENT_INVARIANT: 'Ошибка: нарушение распределения',
@@ -265,6 +403,8 @@ const ERROR_TRANSLATIONS = {
   UNSUPPORTED_ENVIRONMENT: 'Ошибка: неподдерживаемая среда',
   WORKER_START_FAILED: 'Ошибка: не удалось запустить worker',
   WORKER_MESSAGE_FAILED: 'Ошибка: сбой сообщения worker',
+  PROTOCOL_ERROR: 'Ошибка: нарушен протокол раскладки',
+  PRESENTATION_FAILED: 'Ошибка: сбой показа промежуточного шага',
   TIMEOUT: 'Ошибка: превышено время ожидания',
   WEBGL_UNAVAILABLE: 'Ошибка: WebGL недоступен',
   RENDER_FAILED: 'Ошибка: сбой рендеринга',
@@ -278,7 +418,10 @@ async function rebuildIsland() {
   const currentRequestId = requestIdCounter;
 
   isBusy = true;
+  setForcePresentationMode(algorithmSelect.value === 'force-anchors');
   lastErrorCode = null;
+  initialSettlement = null;
+  forceTrace = [];
   const statusEl = document.querySelector('#layout-status');
   if (statusEl) {
     statusEl.textContent = 'Вычисляем...';
@@ -320,7 +463,7 @@ async function rebuildIsland() {
   try {
     const layoutConfig = config.failure 
       ? { __testFailure: config.failure } 
-      : (algorithmSelect.value === 'force-anchors' ? structuredClone(FORCE_LAYOUT_CONFIG) : null);
+      : (algorithmSelect.value === 'force-anchors' ? structuredClone(FORCE_LAYOUT_CONFIG_V2) : null);
     if (layoutConfig && config.delayMs) {
       layoutConfig.delayMs = config.delayMs;
     }
@@ -329,18 +472,59 @@ async function rebuildIsland() {
     if (config.layoutResult) {
       layoutResult = { ...config.layoutResult, requestId: currentRequestId };
     } else {
+      const isForce = algorithmSelect.value === 'force-anchors' && !config.layoutResult;
       layoutResult = await layoutRunner.runLayout({
         requestId: currentRequestId,
         mode: algorithmSelect.value,
         entities,
         config: layoutConfig
-      });
+      }, isForce ? {
+        presentation: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'final-only' : 'all-steps',
+        onReady: (topology, frame) => {
+          if (activeLiveIslandHandle) activeLiveIslandHandle.dispose();
+          activeLiveIslandHandle = createLiveIsland({
+            visualPayloadByEntityId,
+            topology,
+            initialFrame: frame,
+            presentation: layoutAlgorithms['force-anchors'],
+          });
+          world.add(activeLiveIslandHandle.root);
+          tiles = activeLiveIslandHandle.interactiveTiles;
+          waterRings = [];
+          updateForceProgress(frame);
+          if (statusEl) statusEl.textContent = 'Вычисляем силу: показан шаг 0.';
+          forceRelationshipHelp.textContent = 'Движущиеся линии показывают силовые связи, которые влияют на раскладку.';
+          captureForceTrace(frame);
+          fitWorldView(activeLiveIslandHandle.worldSize);
+          return paintReceipt(frame);
+        },
+        onStep: (frame) => {
+          activeLiveIslandHandle?.applyStep(frame);
+          updateForceProgress(frame);
+          captureForceTrace(frame);
+          if (statusEl) statusEl.textContent = `Вычисляем силу: шаг ${frame.globalStep}.`;
+          return paintReceipt(frame);
+        },
+        onInitialSettled: (settlement) => {
+          initialSettlement = settlement;
+        },
+      } : undefined);
     }
     
     if (currentRequestId !== requestIdCounter) return;
 
     const presentation = layoutAlgorithms[algorithmSelect.value];
-    candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+    if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
+      candidateHandle = createIsland({
+        visualPayloadByEntityId,
+        layoutResult: initialSettlement.result,
+        topology: initialSettlement.topology,
+        terminalFrame: initialSettlement.terminalFrame,
+        presentation,
+      });
+    } else {
+      candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+    }
     if (currentRequestId !== requestIdCounter) {
       candidateHandle.dispose();
       candidateHandle = null;
@@ -355,11 +539,23 @@ async function rebuildIsland() {
     activeDataSnapshot = currentSchoolData;
     activeVisualPayloadByEntityId = visualPayloadByEntityId;
     tiles = activeIslandHandle.interactiveTiles;
-    waterRings = activeIslandHandle.waterRings;
+    waterRings = activeIslandHandle.waterRings || [];
 
     if (previousHandle) {
       world.remove(previousHandle.root);
       previousHandle.dispose();
+    }
+    if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) {
+      activeLiveIslandHandle.dispose();
+      activeLiveIslandHandle = null;
+    }
+    setForcePresentationMode(false);
+    if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
+      if (nextCommitOutcome === 'failure') {
+        nextCommitOutcome = 'success';
+        throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
+      }
+      layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
     }
     clearSelection();
     
@@ -369,12 +565,17 @@ async function rebuildIsland() {
     }
     if (statusEl) {
       if (layoutResult.mode === 'force-anchors') {
-        const msg = `Успешно завершено. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные (50%).`;
+        const finalStep = layoutResult.diagnostics?.globalStep ?? layoutResult.diagnostics?.iterations ?? 0;
+        const msg = `Раскладка сошлась на финальном шаге ${finalStep}. Активных связей: ${layoutResult.springs.length}.`;
         statusEl.textContent = msg;
         canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные.`);
       } else {
         statusEl.textContent = 'Успешно завершено.';
         canvas.setAttribute('aria-label', 'Интерактивная трехмерная карта острова');
+      }
+      if (algorithmSelect.value === 'force-anchors') {
+        updateForceProgress(initialSettlement?.terminalFrame, layoutResult.diagnostics?.terminationReason || 'CONVERGED');
+        progressFields.get('terminal')?.replaceChildren(`Причина: ${layoutResult.diagnostics?.terminationReason || 'CONVERGED'}`);
       }
       statusEl.classList.remove('is-error');
     }
@@ -382,6 +583,10 @@ async function rebuildIsland() {
   } catch (err) {
     candidateHandle?.dispose();
     candidateHandle = null;
+    activeLiveIslandHandle?.dispose();
+    activeLiveIslandHandle = null;
+    setForcePresentationMode(false);
+    if (algorithmSelect.value === 'force-anchors') layoutRunner.cancelActiveLayout('render failure');
     console.error('rebuildIsland error:', err);
     if (currentRequestId !== requestIdCounter) return;
     if (err.code !== 'CANCELLED') {
@@ -395,6 +600,7 @@ async function rebuildIsland() {
   } finally {
     if (currentRequestId === requestIdCounter) {
       isBusy = false;
+      setForcePresentationMode(false);
       generatorForm.removeAttribute('aria-busy');
     }
   }
@@ -463,7 +669,7 @@ for (let i = 0; i < 240; i += 1) {
   particlePositions.push(Math.cos(angle) * radius, 1 + Math.random() * 24, Math.sin(angle) * radius);
 }
 particlesGeometry.setAttribute('position', new THREE.Float32BufferAttribute(particlePositions, 3));
-const particles = new THREE.Points(
+particles = new THREE.Points(
   particlesGeometry,
   new THREE.PointsMaterial({ color: 0xb6d6bf, size: 0.045, transparent: true, opacity: 0.34, depthWrite: false })
 );

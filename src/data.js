@@ -131,7 +131,14 @@ export function normalizeHierarchy(sourceEntities) {
       cursor = parentIndexes[cursor];
     }
     if (cursor !== -1 && states[cursor] === 1) {
-      invalidHierarchy('CYCLE', { id: entities[cursor].id });
+      let cycleStart = 0;
+      while (cycleStart < pathLength && path[cycleStart] !== cursor) cycleStart += 1;
+      const cycle = [];
+      for (let cycleIndex = cycleStart; cycleIndex < pathLength; cycleIndex += 1) {
+        cycle.push(entities[path[cycleIndex]].id);
+      }
+      cycle.push(entities[cursor].id);
+      invalidHierarchy('CYCLE', { id: entities[cursor].id, cycle });
     }
 
     let depth = cursor === -1 ? -1 : depths[cursor];

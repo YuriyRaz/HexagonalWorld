@@ -11,12 +11,12 @@ const profiles = [
   {
     name: 'phone',
     testIgnore: '**/layout.benchmark.spec.js',
-    use: { viewport: { width: 360, height: 800 }, hasTouch: true },
+    use: { viewport: { width: 360, height: 800 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
   },
   {
     name: 'tablet',
     testIgnore: '**/layout.benchmark.spec.js',
-    use: { viewport: { width: 768, height: 1024 }, hasTouch: true },
+    use: { viewport: { width: 768, height: 1024 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
   },
   {
     name: 'visual-desktop',
@@ -61,6 +61,21 @@ export default defineConfig({
         viewport: { width: 1440, height: 900 },
         deviceScaleFactor: 1,
       },
+    },
+    {
+      name: 'benchmark-desktop-chromium',
+      testMatch: '**/layout.benchmark.spec.js',
+      use: { browserName: 'chromium', viewport: { width: 1024, height: 720 }, deviceScaleFactor: 1 },
+    },
+    {
+      name: 'benchmark-phone-chromium',
+      testMatch: '**/layout.benchmark.spec.js',
+      use: { browserName: 'chromium', viewport: { width: 360, height: 800 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
+    },
+    {
+      name: 'benchmark-tablet-chromium',
+      testMatch: '**/layout.benchmark.spec.js',
+      use: { browserName: 'chromium', viewport: { width: 768, height: 1024 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
     },
   ],
   webServer: {

@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "node --test",
     "test:e2e": "playwright test --grep-invert @benchmark",
-    "benchmark:layout": "playwright test tests/layout.benchmark.spec.js --project=benchmark-chromium"
+    "benchmark:layout": "playwright test tests/layout.benchmark.spec.js --project=benchmark-desktop-chromium --project=benchmark-phone-chromium --project=benchmark-tablet-chromium"
   },
   "dependencies": {
     "d3-force": "3.0.0",

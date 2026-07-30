@@ -256,6 +256,26 @@ h1 em { color: var(--lime); font-style: normal; }
   line-height: 1.45;
 }
 
+.force-relationship-help {
+  grid-column: 1 / -1;
+  margin: -2px 0 0;
+  color: rgba(224, 237, 226, .58);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.layout-progress {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px 10px;
+  color: rgba(224, 237, 226, .58);
+  font-size: 7px;
+  line-height: 1.35;
+}
+
+.layout-progress [data-force-progress="terminal"] { grid-column: 1 / -1; color: var(--lime); }
+
 .form-error {
   grid-column: 1 / -1;
   min-height: 0;
@@ -399,6 +419,8 @@ h1 em { color: var(--lime); font-style: normal; }
   .lead, .layout-stats { display: none; }
   .generator-form { width: 250px; margin-top: 13px; }
   .selection { margin-top: 10px; width: 250px; }
+  .force-relationship-help { font-size: 7px; }
+  .layout-progress { font-size: 6px; }
   .height-scale { display: none; }
   .controls-help { left: 18px; bottom: 18px; transform: none; gap: 14px; }
   .controls-help > div:first-child { display: none; }

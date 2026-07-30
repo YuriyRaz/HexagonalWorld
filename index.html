@@ -94,6 +94,15 @@
           </label>
           <p class="algorithm-note" id="algorithm-note"></p>
           <p class="layout-status" id="layout-status" role="status" aria-live="polite"></p>
+          <p class="force-relationship-help" id="force-relationship-help">Движущиеся линии показывают силовые связи, которые влияют на раскладку.</p>
+          <div id="layout-progress" class="layout-progress" aria-label="Прогресс силовой раскладки" aria-live="off">
+            <span data-force-progress="global">Шаг: —</span>
+            <span data-force-progress="epoch">Эпоха: 0</span>
+            <span data-force-progress="cooling">Охлаждение: 0 / 256</span>
+            <span data-force-progress="assignment">Стабильность ячеек: 0</span>
+            <span data-force-progress="streak">Серия сходимости: 0 / 8</span>
+            <span data-force-progress="terminal">Причина: —</span>
+          </div>
           <p class="form-error" id="form-error" aria-live="polite"></p>
           <button class="generate-button" type="submit">
             <span>СГЕНЕРИРОВАТЬ ДАННЫЕ</span>

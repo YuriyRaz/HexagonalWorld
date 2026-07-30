@@ -6,24 +6,26 @@ const CURRENT_MAXIMUM_ROOTS = 10;
 const CURRENT_MAXIMUM_INTERNALS_PER_ROOT = 8;
 const LEAVES_PER_DEPTH_ONE_INTERNAL = 60;
 
+export const FORCE_FIXTURE_SEED = 0x5eed003;
+
 export const REPRESENTATIVE_COUNTS = Object.freeze({
-  entityCount: 1225,
+  entityCount: 1500,
   leafCount: 1200,
-  internalCount: 25,
-  rootCount: 5,
-  maxDepth: 2,
-  leafAncestorMembershipCount: 2400,
-  activeLinkCount: 1220,
+  internalCount: 300,
+  rootCount: 1,
+  maxDepth: 16,
+  leafAncestorMembershipCount: 19200,
+  activeLinkCount: 1499,
 });
 
 export const CURRENT_MAXIMUM_COUNTS = Object.freeze({
-  entityCount: 4890,
+  entityCount: 6000,
   leafCount: 4800,
-  internalCount: 90,
-  rootCount: 10,
-  maxDepth: 2,
-  leafAncestorMembershipCount: 9600,
-  activeLinkCount: 4880,
+  internalCount: 1200,
+  rootCount: 1,
+  maxDepth: 16,
+  leafAncestorMembershipCount: 76800,
+  activeLinkCount: 5999,
 });
 
 export const STRUCTURAL_MAXIMUM_COUNTS = Object.freeze({
@@ -80,6 +82,43 @@ function buildDepthTwoForest(prefix, rootCount, internalsPerRoot, leavesPerInter
     }
   }
 
+  return entities;
+}
+
+function buildScaleHierarchy(prefix, leafCount, internalCount) {
+  if (internalCount < 16 || leafCount < internalCount - 15) {
+    throw new RangeError('Scale fixture requires at least sixteen anchors.');
+  }
+  const entities = [];
+  const rootId = `${prefix}-root`;
+  entities.push({ id: rootId, parentId: null, order: 0 });
+  const depthFifteenIds = [];
+  let order = 1;
+  let parentId = rootId;
+
+  for (let depth = 1; depth <= 15; depth += 1) {
+    const id = `${prefix}-chain-${padded(depth, 2)}`;
+    entities.push({ id, parentId, order });
+    order += 1;
+    parentId = id;
+    if (depth === 15) depthFifteenIds.push(id);
+  }
+
+  for (let index = 0; index < internalCount - 16; index += 1) {
+    const id = `${prefix}-anchor-${padded(index, 4)}`;
+    entities.push({ id, parentId: `${prefix}-chain-14`, order });
+    depthFifteenIds.push(id);
+    order += 1;
+  }
+
+  for (let index = 0; index < leafCount; index += 1) {
+    entities.push({
+      id: `${prefix}-leaf-${padded(index, 5)}`,
+      parentId: depthFifteenIds[index % depthFifteenIds.length],
+      order,
+    });
+    order += 1;
+  }
   return entities;
 }
 
@@ -147,21 +186,46 @@ export function buildEmptyHierarchy() {
 }
 
 export function buildRepresentativeHierarchy() {
-  return buildDepthTwoForest(
-    'representative',
-    REPRESENTATIVE_ROOTS,
-    REPRESENTATIVE_INTERNALS_PER_ROOT,
-    LEAVES_PER_DEPTH_ONE_INTERNAL,
-  );
+  return buildScaleHierarchy('representative', 1200, 300);
 }
 
 export function buildCurrentMaximumHierarchy() {
-  return buildDepthTwoForest(
-    'current-maximum',
-    CURRENT_MAXIMUM_ROOTS,
-    CURRENT_MAXIMUM_INTERNALS_PER_ROOT,
-    LEAVES_PER_DEPTH_ONE_INTERNAL,
-  );
+  return buildScaleHierarchy('maximum', 4800, 1200);
+}
+
+export const buildRepresentativeScaleHierarchy = buildRepresentativeHierarchy;
+export const buildMaximumScaleHierarchy = buildCurrentMaximumHierarchy;
+
+export function buildMovingConflictHierarchy() {
+  return [
+    { id: 'moving-root', parentId: null, order: 0 },
+    { id: 'moving-left', parentId: 'moving-root', order: 1 },
+    { id: 'moving-right', parentId: 'moving-root', order: 2 },
+    { id: 'moving-left-a', parentId: 'moving-left', order: 3 },
+    { id: 'moving-left-b', parentId: 'moving-left', order: 4 },
+    { id: 'moving-right-a', parentId: 'moving-right', order: 5 },
+    { id: 'moving-right-b', parentId: 'moving-right', order: 6 },
+  ];
+}
+
+export function buildImmediateConvergenceHierarchy() {
+  return [{ id: 'immediate-root-leaf', parentId: null, order: 0 }];
+}
+
+export function buildNoRelationHierarchy() {
+  return buildImmediateConvergenceHierarchy();
+}
+
+export function buildStalledConvergenceHierarchy() {
+  return buildMovingConflictHierarchy();
+}
+
+export function buildUnsupportedHierarchy() {
+  return Array.from({ length: 6001 }, (_, index) => ({
+    id: `unsupported-${index}`,
+    parentId: index === 0 ? null : 'unsupported-0',
+    order: index,
+  }));
 }
 
 export function buildStructuralMaximumHierarchy() {
