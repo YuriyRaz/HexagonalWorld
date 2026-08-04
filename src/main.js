@@ -210,6 +210,7 @@ function clearSelection() {
 function setForcePresentationMode(enabled) {
   forcePresentationActive = enabled;
   renderer.shadowMap.enabled = !enabled;
+  if (!enabled) renderer.shadowMap.needsUpdate = true;
   if (particles) particles.visible = !enabled;
   if (enabled && activeIslandHandle) activeIslandHandle.root.visible = false;
   if (!enabled && activeIslandHandle) activeIslandHandle.root.visible = true;
@@ -270,6 +271,9 @@ window.__hexWorldTest = {
     busy: isBusy,
     lastErrorCode,
     activeRootId: activeIslandHandle?.root.uuid || null,
+    liveRootId: activeLiveIslandHandle?.root.uuid || null,
+    activeRootVisible: activeIslandHandle?.root.visible ?? null,
+    activeRootInWorld: activeIslandHandle ? world.children.includes(activeIslandHandle.root) : null,
     activeResult: activeLayoutResult ? structuredClone(activeLayoutResult) : null,
     hoveredEntityId: hoveredTile ? (hoveredTile.object.userData.instances ? hoveredTile.object.userData.instances[hoveredTile.instanceId]?.payload?.entityId : null) : null,
     selectedEntityId: selectedTile ? (selectedTile.object.userData.instances ? selectedTile.object.userData.instances[selectedTile.instanceId]?.payload?.entityId : null) : null,
@@ -397,33 +401,26 @@ function captureForceTrace(frame) {
 }
 
 async function commitEpochSettlement(settlement) {
-  const candidate = createIsland({
-    visualPayloadByEntityId: activeVisualPayloadByEntityId,
-    layoutResult: settlement.result,
-    topology: settlement.topology,
-    terminalFrame: settlement.terminalFrame,
-    presentation: layoutAlgorithms['force-anchors'],
-  });
+  if (!activeLiveIslandHandle) {
+    throw Object.assign(new Error('No live island to promote.'), { code: 'RENDER_FAILED', details: { reason: 'no-live-island' } });
+  }
   if (nextCommitOutcome === 'failure') {
     nextCommitOutcome = 'success';
-    candidate.dispose();
     throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
   }
     const previous = activeIslandHandle;
-    world.add(candidate.root);
-    activeIslandHandle = candidate;
+    activeLiveIslandHandle.promote(settlement.terminalFrame);
+    activeIslandHandle = activeLiveIslandHandle;
+    activeLiveIslandHandle = null;
     activeLayoutResult = settlement.result;
-    tiles = candidate.interactiveTiles;
+    tiles = activeIslandHandle.interactiveTiles;
     waterRings = [];
-    if (previous) {
+    if (previous && previous !== activeIslandHandle) {
       world.remove(previous.root);
       previous.dispose();
     }
-    activeLiveIslandHandle?.dispose();
-    activeLiveIslandHandle = null;
-    restoreSelectionByEntityId(candidate.interactiveTiles);
+    restoreSelectionByEntityId(activeIslandHandle.interactiveTiles);
     layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
-    fitWorldView(candidate.worldSize);
 }
 
 if (new URLSearchParams(location.search).has('testDiagnostics')) {
@@ -534,6 +531,7 @@ async function rebuildIsland() {
   }
 
   let candidateHandle = null;
+  let skipForcePresentationRestore = false;
   const previousActiveHandle = activeIslandHandle;
   try {
     const layoutConfig = config.failure 
@@ -605,53 +603,76 @@ async function rebuildIsland() {
     if (currentRequestId !== requestIdCounter) return;
 
     const presentation = layoutAlgorithms[algorithmSelect.value];
-    if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
-      candidateHandle = createIsland({
-        visualPayloadByEntityId,
-        layoutResult: initialSettlement.result,
-        topology: initialSettlement.topology,
-        terminalFrame: initialSettlement.terminalFrame,
-        presentation,
-      });
-    } else {
-      candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
-    }
-    if (currentRequestId !== requestIdCounter) {
-      candidateHandle.dispose();
-      candidateHandle = null;
-      return;
-    }
-
-    if (algorithmSelect.value === 'force-anchors' && initialSettlement && nextCommitOutcome === 'failure') {
-      nextCommitOutcome = 'success';
-      candidateHandle.dispose();
-      candidateHandle = null;
-      throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
-    }
-    world.add(candidateHandle.root);
-    activeIslandHandle = candidateHandle;
-    candidateHandle = null;
-    activeLayoutResult = layoutResult;
-    activeDataSnapshot = currentSchoolData;
-    activeVisualPayloadByEntityId = visualPayloadByEntityId;
-    tiles = activeIslandHandle.interactiveTiles;
-    waterRings = activeIslandHandle.waterRings || [];
-
-    if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) {
-      activeLiveIslandHandle.dispose();
+    if (algorithmSelect.value === 'force-anchors' && initialSettlement && activeLiveIslandHandle) {
+      if (nextCommitOutcome === 'failure') {
+        nextCommitOutcome = 'success';
+        throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
+      }
+      activeLiveIslandHandle.promote(initialSettlement.terminalFrame);
+      activeIslandHandle = activeLiveIslandHandle;
       activeLiveIslandHandle = null;
-    }
-    setForcePresentationMode(false);
-    if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
+      candidateHandle = null;
+      activeLayoutResult = layoutResult;
+      activeDataSnapshot = currentSchoolData;
+      activeVisualPayloadByEntityId = visualPayloadByEntityId;
+      tiles = activeIslandHandle.interactiveTiles;
+      waterRings = [];
       layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
+      if (previousActiveHandle && previousActiveHandle !== activeIslandHandle) {
+        world.remove(previousActiveHandle.root);
+        previousActiveHandle.dispose();
+      }
+      clearSelection();
+      skipForcePresentationRestore = true;
+    } else {
+      if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
+        candidateHandle = createIsland({
+          visualPayloadByEntityId,
+          layoutResult: initialSettlement.result,
+          topology: initialSettlement.topology,
+          terminalFrame: initialSettlement.terminalFrame,
+          presentation,
+        });
+      } else {
+        candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+      }
+      if (currentRequestId !== requestIdCounter) {
+        candidateHandle.dispose();
+        candidateHandle = null;
+        return;
+      }
+
+      if (algorithmSelect.value === 'force-anchors' && initialSettlement && nextCommitOutcome === 'failure') {
+        nextCommitOutcome = 'success';
+        candidateHandle.dispose();
+        candidateHandle = null;
+        throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
+      }
+      world.add(candidateHandle.root);
+      activeIslandHandle = candidateHandle;
+      candidateHandle = null;
+      activeLayoutResult = layoutResult;
+      activeDataSnapshot = currentSchoolData;
+      activeVisualPayloadByEntityId = visualPayloadByEntityId;
+      tiles = activeIslandHandle.interactiveTiles;
+      waterRings = activeIslandHandle.waterRings || [];
+
+      if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) {
+        activeLiveIslandHandle.dispose();
+        activeLiveIslandHandle = null;
+      }
+      setForcePresentationMode(false);
+      if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
+        layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
+      }
+      if (previousActiveHandle) {
+        world.remove(previousActiveHandle.root);
+        previousActiveHandle.dispose();
+      }
+      clearSelection();
+
+      fitWorldView(activeIslandHandle.worldSize);
     }
-    if (previousActiveHandle) {
-      world.remove(previousActiveHandle.root);
-      previousActiveHandle.dispose();
-    }
-    clearSelection();
-    
-    fitWorldView(activeIslandHandle.worldSize);
     if (!useTestEntities) {
       updateWorldSummary(activeIslandHandle.stats, activeDataSnapshot);
     }
@@ -702,7 +723,7 @@ async function rebuildIsland() {
   } finally {
     if (currentRequestId === requestIdCounter) {
       isBusy = false;
-      setForcePresentationMode(false);
+      if (!skipForcePresentationRestore) setForcePresentationMode(false);
       generatorForm.removeAttribute('aria-busy');
     }
   }

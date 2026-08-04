@@ -439,18 +439,27 @@ function createForceIsland(input, stable) {
   updateSprings(stable ? terminalFrame : initialFrame);
   let lastGlobalStep = stable ? terminalFrame.globalStep : initialFrame.globalStep;
   let retired = false;
-  return {
+  let isStable = stable;
+  const handle = {
     requestId: topology.requestId,
     root,
     interactiveTiles: [occupiedTiles],
     applyStep(frame) {
       if (retired) throw renderFailure('RETIRED_ISLAND');
       if (frame.requestId !== topology.requestId || frame.globalStep !== lastGlobalStep + 1) throw renderFailure('INVALID_FORCE_STEP', { expected: lastGlobalStep + 1, actual: frame.globalStep });
-      // Validate every coordinate before changing either geometry buffer.
       for (const value of frame.positions) if (!Number.isFinite(value)) throw renderFailure('NONFINITE_FORCE_FRAME');
       applyPosition(frame);
       updateSprings(frame);
       lastGlobalStep = frame.globalStep;
+    },
+    promote(terminal) {
+      if (retired) throw renderFailure('PROMOTE_DISPOSED');
+      if (isStable) throw renderFailure('PROMOTE_ALREADY_STABLE');
+      isStable = true;
+      retired = true;
+      handle.terminalFrame = terminal;
+      handle.stable = true;
+      return handle;
     },
     inspectCurrentFrame() {
       return {
@@ -470,8 +479,10 @@ function createForceIsland(input, stable) {
     },
     stats: layoutResult?.stats ?? { occupiedCount: leafIndices.length, boundaryGaps: [] },
     worldSize,
+    stable: isStable,
     terminalFrame: stable ? terminalFrame : null,
   };
+  return handle;
 }
 
 export function createLiveIsland(input) {

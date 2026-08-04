@@ -258,6 +258,27 @@ test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-
     expect(afterSettling.activeResult).toEqual(committed.activeResult);
   });
 
+  test('promote-in-place keeps the same scene root across the force commit transition', async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await configureNextRequest(page, { entities: buildSmallValidHierarchy(), delayMs: 80 });
+    await page.locator('#layout-algorithm').selectOption(FORCE_MODE);
+    let liveRootId;
+    await expect.poll(async () => {
+      const s = await getState(page);
+      liveRootId = s.liveRootId;
+      return s.liveRootId;
+    }).toBeTruthy();
+
+    await waitForSuccess(page);
+    const committedState = await getState(page);
+    expect(committedState.activeRootId).toBe(liveRootId);
+    expect(committedState.activeRootVisible).toBe(true);
+    expect(committedState.activeRootInWorld).toBe(true);
+    expect(committedState.activeResult.mode).toBe(FORCE_MODE);
+  });
+
   test('hides the tab with one outstanding frame and restores the same frame', { tag: ['@US2-usable-lifecycle'] }, async ({ page }) => {
     await openApp(page);
     await expectTestApi(page);

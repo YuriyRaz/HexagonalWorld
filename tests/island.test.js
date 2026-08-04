@@ -556,3 +556,128 @@ describe('createLiveIsland and applyStep', () => {
     }
   });
 });
+
+describe('promote()', () => {
+  function makeForceInput(positions, globalStep = 0) {
+    const topology = {
+      requestId: 1,
+      nodeIds: ['entity-alpha', 'entity-beta'],
+      nodeKinds: ['leaf', 'leaf'],
+      relations: [],
+    };
+    const initialFrame = {
+      requestId: 1,
+      globalStep,
+      positions: new Float32Array(positions),
+    };
+    return {
+      visualPayloadByEntityId: makePayloadMap(),
+      topology,
+      initialFrame,
+      presentation: { occupiedOpacity: 0.5, showSprings: false },
+    };
+  }
+
+  test('promote returns the same handle identity', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      const terminal = { globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) };
+      const promoted = handle.promote(terminal);
+      assert.equal(promoted, handle);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('promote sets terminalFrame on the handle', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      assert.equal(handle.terminalFrame, null);
+      const terminal = { globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) };
+      handle.promote(terminal);
+      assert.equal(handle.terminalFrame, terminal);
+      assert.equal(handle.stable, true);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('applyStep throws after promote', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
+      assert.throws(
+        () => handle.applyStep({ requestId: 1, globalStep: 1, positions: new Float32Array([1, 2, 6, 5]) }),
+        /Island rendering failed./,
+      );
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('promote throws when already stable', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
+      assert.throws(
+        () => handle.promote({ globalStep: 2, positions: new Float32Array([0, 0, 5, 3]) }),
+        /Island rendering failed./,
+      );
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('promote throws when disposed', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    handle.dispose();
+    assert.throws(
+      () => handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) }),
+      /Island rendering failed./,
+    );
+  });
+
+  test('InstancedMesh count, material opacity, and color are unchanged after promote', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      const occupied = handle.interactiveTiles[0];
+      const countBefore = occupied.count;
+      const opacityBefore = occupied.material.opacity;
+      const colorBefore = new THREE.Color();
+      occupied.getColorAt(0, colorBefore);
+
+      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
+
+      assert.equal(occupied.count, countBefore);
+      assert.equal(occupied.material.opacity, opacityBefore);
+      const colorAfter = new THREE.Color();
+      occupied.getColorAt(0, colorAfter);
+      assert.equal(colorAfter.getHex(), colorBefore.getHex());
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('promote creates no new geometries, materials, or meshes', () => {
+    const input = makeForceInput([0, 0, 5, 3]);
+    input.topology.relations = [{ sourceIndex: 0, targetIndex: 1 }];
+    input.presentation.showSprings = true;
+    const handle = createLiveIsland(input);
+    try {
+      const countChildren = (group) => {
+        let count = 0;
+        group.traverse(() => { count++; });
+        return count;
+      };
+      const childrenBefore = countChildren(handle.root);
+      const tilesBefore = handle.interactiveTiles.length;
+
+      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
+
+      assert.equal(countChildren(handle.root), childrenBefore);
+      assert.equal(handle.interactiveTiles.length, tilesBefore);
+    } finally {
+      handle.dispose();
+    }
+  });
+});
