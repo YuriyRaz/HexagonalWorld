@@ -1,610 +1,296 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
+import { normalizeHierarchy } from '../src/data.js';
 import {
   FORCE_LAYOUT_CONFIG,
+  FORCE_LAYOUT_CONFIG_V2,
   ForceLayoutError,
   calculateForceLayout,
+  createForceLayoutSession,
   mulberry32,
 } from '../src/force-layout.js';
+import { axialToPlane, quantize } from '../src/hex.js';
 import {
-  buildArbitraryDepthHierarchy,
   buildCycleHierarchy,
-  buildDuplicateIdHierarchy,
-  buildEmptyHierarchy,
+  buildDepthSeventeenHierarchy,
   buildGroupingHierarchy,
-  buildMissingParentHierarchy,
   buildSingleRootLeafHierarchy,
   buildSixThousandLinkHierarchy,
-  buildSmallValidHierarchy,
-  buildStructuralMaximumHierarchy,
 } from './fixtures/hierarchies.js';
 
-const EXPECTED_V1_CONFIG = {
-  version: 1,
-  seed: 0x9e3779b9,
-  totalTicks: 256,
-  mutableEndTick: 159,
-  settleEndTick: 223,
-  assignmentInterval: 4,
-  candidateRadius: 3,
-  predictionLookahead: 0.75,
-  movePenalty: 0.05,
-  alphaSchedule: [
-    { fromTick: 0, toTick: 159, from: 1, to: 0.12 },
-    { fromTick: 160, toTick: 223, from: 0.12, to: 0.02 },
-    { fromTick: 224, toTick: 255, from: 0.02, to: 0.005 },
-  ],
-  velocityDecay: 0.4,
-  hexStrength: { mutable: 0.2, settle: 0.45 },
-  manyBodyStrength: -18,
-  manyBodyTheta: 0.9,
-  manyBodyDistanceMin: 0.1,
-  manyBodyDistanceMax: 32,
-  centerStrength: 0.01,
-  linkDistance: 2,
-  linkStrength: 0.2,
-  linkIterations: 1,
-  quantizationStep: 0.000001,
-  convergenceThresholds: {
-    stableAssignmentEpochs: 3,
-    maxTargetError: 0.25,
-    rmsTargetError: 0.08,
-    maxAnchorVelocity: 0.02,
-  },
-};
-
-const CALCULATION_ERROR_CODES = [
-  'UNKNOWN_MODE',
-  'EMPTY_HIERARCHY',
-  'INVALID_HIERARCHY',
-  'UNSUPPORTED_SCALE',
-  'NON_FINITE_STATE',
-  'ASSIGNMENT_INVARIANT',
-  'NOT_CONVERGED',
-];
-
-function deepFreeze(value) {
-  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  Object.freeze(value);
-  for (const child of Object.values(value)) deepFreeze(child);
-  return value;
-}
-
-function assertDeepFrozen(value, path = 'FORCE_LAYOUT_CONFIG') {
-  if (value === null || typeof value !== 'object') return;
-  assert.equal(Object.isFrozen(value), true, `${path} must be frozen`);
-  for (const [key, child] of Object.entries(value)) {
-    assertDeepFrozen(child, `${path}.${key}`);
-  }
-}
-
-function makeRequest(entities = buildSmallValidHierarchy(), overrides = {}) {
+function request(entities = buildSingleRootLeafHierarchy(), overrides = {}) {
   return {
     requestId: 17,
     mode: 'force-anchors',
     entities,
-    config: structuredClone(FORCE_LAYOUT_CONFIG),
+    config: structuredClone(FORCE_LAYOUT_CONFIG_V2),
     ...overrides,
   };
 }
 
-function captureCalculationError(callback, expectedCode) {
-  let captured;
-  assert.throws(callback, (error) => {
-    captured = error;
-    return true;
-  });
-  assert.ok(captured instanceof Error);
-  assert.equal(captured.code, expectedCode);
-  assert.ok(captured.details !== null && typeof captured.details === 'object');
-  return captured;
+function settle(session) {
+  let frame = session.initialFrame();
+  while (frame.terminal === 'none') frame = session.advanceOneStep();
+  return frame;
 }
 
-function compareEntities(first, second) {
-  if (first.order < second.order) return -1;
-  if (first.order > second.order) return 1;
-  if (first.id < second.id) return -1;
-  if (first.id > second.id) return 1;
-  return 0;
-}
-
-function axialDistance(first, second) {
-  const q = first.q - second.q;
-  const r = first.r - second.r;
-  return (Math.abs(q) + Math.abs(r) + Math.abs(q + r)) / 2;
-}
-
-function hierarchyFacts(entities) {
-  const entityById = new Map(entities.map((entity) => [entity.id, entity]));
-  const childCountById = new Map(entities.map((entity) => [entity.id, 0]));
-  for (const entity of entities) {
-    if (entity.parentId !== null) {
-      childCountById.set(entity.parentId, childCountById.get(entity.parentId) + 1);
-    }
-  }
-
-  const depthById = new Map();
-  const getDepth = (entity) => {
-    if (depthById.has(entity.id)) return depthById.get(entity.id);
-    const depth = entity.parentId === null ? 0 : getDepth(entityById.get(entity.parentId)) + 1;
-    depthById.set(entity.id, depth);
-    return depth;
-  };
-  for (const entity of entities) getDepth(entity);
-
+function snapshotForceState(session) {
   return {
-    entityById,
-    childCountById,
-    depthById,
-    leaves: entities.filter((entity) => childCountById.get(entity.id) === 0),
-    internals: entities.filter((entity) => childCountById.get(entity.id) > 0),
+    phase: session.state.phase,
+    globalStep: session.state.globalStep,
+    epoch: session.state.epoch,
+    coolingStep: session.state.coolingStep,
+    acceptedCommandSeq: session.state.acceptedCommandSeq,
+    assignmentHash: session.initialFrame().assignmentHash,
+    nodes: session.nodes.map(({ x, y, vx, vy, fx, fy }) => ({ x, y, vx, vy, fx, fy })),
+    transcript: structuredClone(session.transcript),
   };
 }
 
-function assertFiniteNumbers(value, path = 'result') {
-  if (typeof value === 'number') {
-    assert.equal(Number.isFinite(value), true, `${path} must be finite`);
-    return;
-  }
-  if (value === null || typeof value !== 'object') return;
-  for (const [key, child] of Object.entries(value)) {
-    assertFiniteNumbers(child, `${path}.${key}`);
-  }
-}
-
-function assertCompleteUniqueCells(result, entities) {
-  const { leaves, internals } = hierarchyFacts(entities);
-  const expectedLeafIds = leaves.sort(compareEntities).map(({ id }) => id);
-  const placementIds = result.placements.map(({ entityId }) => entityId);
-
-  assert.deepEqual(placementIds, expectedLeafIds);
-  assert.equal(new Set(placementIds).size, leaves.length);
-  assert.equal(result.placements.length, leaves.length);
-  assert.equal(result.stats.occupiedCount, leaves.length);
-  assert.ok(result.placements.every(({ q, r }) => Number.isInteger(q) && Number.isInteger(r)));
-  assert.equal(
-    new Set(result.placements.map(({ q, r }) => JSON.stringify([q, r]))).size,
-    leaves.length,
-  );
-  assert.ok(internals.every(({ id }) => !placementIds.includes(id)), 'anchors must not be placed');
-  assert.ok(Number.isInteger(result.gridRadius));
-  assert.ok(result.gridRadius >= 0 && result.gridRadius <= 256);
-}
-
-function alphaAtTick(tick) {
-  const phase = FORCE_LAYOUT_CONFIG.alphaSchedule.find(({ fromTick, toTick }) => (
-    tick >= fromTick && tick <= toTick
-  ));
-  assert.ok(phase, `tick ${tick} must have an alpha phase`);
-  if (phase.fromTick === phase.toTick) return phase.to;
-  const progress = (tick - phase.fromTick) / (phase.toTick - phase.fromTick);
-  return phase.from + (phase.to - phase.from) * progress;
-}
-
-function groupingRatios(entities, placements) {
-  const { entityById, depthById, leaves, internals } = hierarchyFacts(entities);
-  const placementById = new Map(placements.map((placement) => [placement.entityId, placement]));
-  const eligibleDepths = [...new Set(internals.map(({ id }) => depthById.get(id)))].sort((a, b) => a - b);
-  const ratios = [];
-
-  for (const depth of eligibleDepths) {
-    const ancestorByLeafId = new Map();
-    const leafCountByAncestorId = new Map();
-    for (const leaf of leaves) {
-      let ancestorId = leaf.parentId;
-      while (ancestorId !== null && depthById.get(ancestorId) !== depth) {
-        ancestorId = entityById.get(ancestorId).parentId;
-      }
-      if (ancestorId === null) continue;
-      ancestorByLeafId.set(leaf.id, ancestorId);
-      leafCountByAncestorId.set(ancestorId, (leafCountByAncestorId.get(ancestorId) ?? 0) + 1);
-    }
-
-    const eligibleAncestorIds = new Set(
-      [...leafCountByAncestorId]
-        .filter(([, count]) => count >= 2)
-        .map(([ancestorId]) => ancestorId),
+describe('version-2 public calculation', () => {
+  test('uses one deeply frozen V2 configuration and a thin synchronous session adapter', () => {
+    assert.strictEqual(FORCE_LAYOUT_CONFIG, FORCE_LAYOUT_CONFIG_V2);
+    assert.equal(FORCE_LAYOUT_CONFIG.version, 2);
+    assert.equal(Object.isFrozen(FORCE_LAYOUT_CONFIG), true);
+    assert.equal(Object.isFrozen(FORCE_LAYOUT_CONFIG.alphaSchedule), true);
+    assert.equal(
+      FORCE_LAYOUT_CONFIG.alphaSchedule.decay,
+      1 - Math.pow(
+        FORCE_LAYOUT_CONFIG.alphaSchedule.minimum / FORCE_LAYOUT_CONFIG.alphaSchedule.initial,
+        1 / FORCE_LAYOUT_CONFIG.maxCoolingSteps,
+      ),
     );
-    if (eligibleAncestorIds.size < 2) continue;
 
-    const includedLeaves = leaves.filter((leaf) => eligibleAncestorIds.has(ancestorByLeafId.get(leaf.id)));
-    let sameTotal = 0;
-    let differentTotal = 0;
-    for (const leaf of includedLeaves) {
-      const placement = placementById.get(leaf.id);
-      const ancestorId = ancestorByLeafId.get(leaf.id);
-      let nearestSame = Infinity;
-      let nearestDifferent = Infinity;
+    const result = calculateForceLayout(request());
+    assert.equal(result.diagnostics.version, 2);
+    assert.equal(result.diagnostics.terminationReason, 'CONVERGED');
+    assert.equal(result.diagnostics.coolingStep, 39);
+  });
 
-      for (const other of includedLeaves) {
-        if (other.id === leaf.id) continue;
-        const distance = axialDistance(placement, placementById.get(other.id));
-        if (ancestorByLeafId.get(other.id) === ancestorId) {
-          nearestSame = Math.min(nearestSame, distance);
-        } else {
-          nearestDifferent = Math.min(nearestDifferent, distance);
-        }
-      }
+  test('does not mutate frozen input and remains deterministic', () => {
+    const input = request();
+    const expected = structuredClone(input);
+    Object.freeze(input.entities[0]);
+    Object.freeze(input.entities);
+    Object.freeze(input.config);
+    Object.freeze(input);
 
-      assert.ok(Number.isFinite(nearestSame));
-      assert.ok(Number.isFinite(nearestDifferent));
-      sameTotal += nearestSame;
-      differentTotal += nearestDifferent;
-    }
+    const first = calculateForceLayout(input);
+    const second = calculateForceLayout(request());
+    assert.deepEqual(input, expected);
+    assert.deepEqual(second, first);
+  });
 
-    ratios.push({
-      depth,
-      sameMean: sameTotal / includedLeaves.length,
-      differentMean: differentTotal / includedLeaves.length,
+  test('rejects cycles and unsupported link scale through typed boundaries', () => {
+    assert.throws(
+      () => createForceLayoutSession(request(buildCycleHierarchy())),
+      (error) => error instanceof ForceLayoutError
+        && error.code === 'INVALID_HIERARCHY'
+        && error.details.reason === 'CYCLE',
+    );
+    assert.throws(
+      () => createForceLayoutSession(request(buildSixThousandLinkHierarchy())),
+      (error) => error instanceof ForceLayoutError
+        && error.code === 'UNSUPPORTED_SCALE'
+        && error.details.violations.some(({ measure }) => measure === 'activeLinkCount'),
+    );
+  });
+
+  test('keeps the seeded random source deterministic', () => {
+    const first = mulberry32(0x5eed003);
+    const second = mulberry32(0x5eed003);
+    for (let index = 0; index < 16; index += 1) assert.equal(first(), second());
+  });
+});
+
+describe('unbounded hierarchy depth', () => {
+  test('accepts depth 17 while retaining the aggregate membership scale limit', () => {
+    const entities = buildDepthSeventeenHierarchy();
+    const normalized = normalizeHierarchy(entities);
+    assert.equal(normalized.analysis.counts.maxDepth, 17);
+
+    const session = createForceLayoutSession(request(entities));
+    assert.equal(session.topology().nodeIds.length, 18);
+    session.dispose();
+  });
+});
+
+describe('exact quantization and canonical control radius', () => {
+  test('uses JavaScript Math.round ties including negative half ties', () => {
+    assert.equal(quantize(1.25, 0.5), 1.5);
+    assert.equal(quantize(-1.25, 0.5), -1);
+    assert.equal(quantize(-0.0000005, 0.000001), 0);
+  });
+
+  test('canonicalizes plane coordinates before inclusive quantized axial-radius validation', () => {
+    const session = createForceLayoutSession(request());
+    settle(session);
+    const boundary = axialToPlane(256, 0);
+    const submittedX = boundary.x + 0.0000004;
+    assert.equal(session.enqueueControl({
+      requestId: 17,
+      commandSeq: 1,
+      action: 'set-fixed-position',
+      entityId: 'single-root-leaf',
+      x: submittedX,
+      y: boundary.z,
+    }), null);
+    const held = session.advanceOneStep();
+    assert.equal(held.controlReceipts[0].accepted, true);
+    assert.equal(session.transcript[0].x, quantize(submittedX, 0.000001));
+
+    const release = session.enqueueControl({
+      requestId: 17,
+      commandSeq: 2,
+      action: 'release-fixed-position',
+      entityId: 'single-root-leaf',
     });
-  }
+    assert.equal(release, null);
+    session.advanceOneStep();
 
-  return ratios;
-}
-
-describe('force layout public configuration and random source', () => {
-  test('exports the exact deeply frozen version-1 configuration', () => {
-    assert.deepEqual(FORCE_LAYOUT_CONFIG, EXPECTED_V1_CONFIG);
-    assert.deepEqual(Object.keys(FORCE_LAYOUT_CONFIG), Object.keys(EXPECTED_V1_CONFIG));
-    assertDeepFrozen(FORCE_LAYOUT_CONFIG);
-  });
-
-  test('implements Mulberry32 with unsigned seed normalization', () => {
-    const random = mulberry32(0x9e3779b9);
-    assert.deepEqual(Array.from({ length: 6 }, () => random()), [
-      0.3588899802416563,
-      0.10590326134115458,
-      0.675290479324758,
-      0.9179345588199794,
-      0.10157715040259063,
-      0.30100292386487126,
-    ]);
-
-    const negative = mulberry32(-1);
-    const unsigned = mulberry32(0xffffffff);
-    for (let index = 0; index < 8; index += 1) {
-      const value = negative();
-      assert.equal(value, unsigned());
-      assert.ok(value >= 0 && value < 1);
-    }
-  });
-
-  test('defines typed calculation errors with non-localized code and details', () => {
-    for (const code of CALCULATION_ERROR_CODES) {
-      const details = { testCode: code };
-      const error = new ForceLayoutError(code, details);
-      assert.ok(error instanceof Error);
-      assert.equal(error.name, 'ForceLayoutError');
-      assert.equal(error.code, code);
-      assert.strictEqual(error.details, details);
-    }
+    const outside = axialToPlane(256.001, 0);
+    const rejected = session.enqueueControl({
+      requestId: 17,
+      commandSeq: 3,
+      action: 'set-fixed-position',
+      entityId: 'single-root-leaf',
+      x: outside.x,
+      y: outside.z,
+    });
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.error.code, 'POSITION_OUTSIDE_GRID');
+    assert.equal(session.state.acceptedCommandSeq, 2);
+    session.dispose();
   });
 });
 
-describe('calculateForceLayout validation and immutability', () => {
-  test('does not mutate a deeply frozen request, entities, or caller-owned config', () => {
-    const request = makeRequest();
-    const snapshot = structuredClone(request);
-    deepFreeze(request);
+describe('bounded deferred acceptance and reusable storage', () => {
+  test('ranks reusable candidates by quantized cost, q, r and preserves unique ownership', () => {
+    const session = createForceLayoutSession(request(buildGroupingHierarchy()));
+    const storage = session.assignmentStorage;
+    const references = Object.values(storage).filter(ArrayBuffer.isView);
 
-    const result = calculateForceLayout(request);
-
-    assert.deepEqual(request, snapshot);
-    assert.notStrictEqual(result.placements, request.entities);
-    assertCompleteUniqueCells(result, request.entities);
-  });
-
-  test('accepts an exact cloned v1 config and rejects version or value drift', () => {
-    assert.doesNotThrow(() => calculateForceLayout(makeRequest(buildSingleRootLeafHierarchy())));
-
-    const wrongVersion = structuredClone(FORCE_LAYOUT_CONFIG);
-    wrongVersion.version = 2;
-    captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildSingleRootLeafHierarchy(), { config: wrongVersion })),
-      'INVALID_HIERARCHY',
-    );
-
-    const changedValue = structuredClone(FORCE_LAYOUT_CONFIG);
-    changedValue.hexStrength.settle += 0.01;
-    captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildSingleRootLeafHierarchy(), { config: changedValue })),
-      'INVALID_HIERARCHY',
-    );
-
-    captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildSingleRootLeafHierarchy(), { config: null })),
-      'INVALID_HIERARCHY',
-    );
-  });
-
-  test('rejects unknown mode, empty input, and malformed hierarchies with typed details', () => {
-    captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildSingleRootLeafHierarchy(), { mode: 'packed' })),
-      'UNKNOWN_MODE',
-    );
-    captureCalculationError(() => calculateForceLayout(makeRequest(buildEmptyHierarchy())), 'EMPTY_HIERARCHY');
-
-    for (const build of [
-      buildDuplicateIdHierarchy,
-      buildMissingParentHierarchy,
-      buildCycleHierarchy,
-    ]) {
-      captureCalculationError(() => calculateForceLayout(makeRequest(build())), 'INVALID_HIERARCHY');
+    for (let index = 0; index < 4; index += 1) session.advanceOneStep();
+    assert.equal(storage.candidateCapacity, 38);
+    assert.ok(session.state.proposalCount > 0);
+    for (let leafIndex = 0; leafIndex < session.leafNodes.length; leafIndex += 1) {
+      const start = leafIndex * storage.candidateCapacity;
+      for (let candidate = 1; candidate < storage.candidateCounts[leafIndex]; candidate += 1) {
+        const previous = start + candidate - 1;
+        const current = start + candidate;
+        assert.ok(
+          storage.costs[previous] < storage.costs[current]
+          || (storage.costs[previous] === storage.costs[current]
+            && (storage.candidateQ[previous] < storage.candidateQ[current]
+              || (storage.candidateQ[previous] === storage.candidateQ[current]
+                && storage.candidateR[previous] <= storage.candidateR[current]))),
+        );
+      }
     }
+    assert.equal(
+      new Set(session.leafNodes.map(({ assignedQ, assignedR }) => `${assignedQ},${assignedR}`)).size,
+      session.leafNodes.length,
+    );
+
+    for (let index = 0; index < 4; index += 1) session.advanceOneStep();
+    assert.deepEqual(Object.values(storage).filter(ArrayBuffer.isView), references);
+    assert.ok(
+      session.state.proposalCount
+      <= session.leafNodes.length * storage.candidateCapacity * session.state.assignmentEpochs,
+    );
+    session.dispose();
   });
 
-  test('accepts the 5,999-link preflight boundary and rejects 6,000 links before config/simulation', () => {
-    const acceptedBoundaryError = captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildStructuralMaximumHierarchy(), { config: null })),
-      'INVALID_HIERARCHY',
-    );
-    assert.notEqual(acceptedBoundaryError.code, 'UNSUPPORTED_SCALE');
-
-    const rejectedBoundaryError = captureCalculationError(
-      () => calculateForceLayout(makeRequest(buildSixThousandLinkHierarchy(), { config: null })),
-      'UNSUPPORTED_SCALE',
-    );
-    assert.ok(Array.isArray(rejectedBoundaryError.details.violations));
-    assert.ok(rejectedBoundaryError.details.violations.some((violation) => (
-      violation.measure === 'activeLinkCount'
-      && violation.actual === 6000
-      && violation.maximum === 5999
-    )));
+  test('reuses movement, target, prior-position, and assignment working storage across steps', () => {
+    const session = createForceLayoutSession(request());
+    const targetError = session.state.targetError;
+    const movement = session.state.movement;
+    const previousPositions = session.previousPositions;
+    const candidateQ = session.assignmentStorage.candidateQ;
+    for (let index = 0; index < 12; index += 1) session.advanceOneStep();
+    assert.strictEqual(session.state.targetError, targetError);
+    assert.strictEqual(session.state.movement, movement);
+    assert.strictEqual(session.previousPositions, previousPositions);
+    assert.strictEqual(session.assignmentStorage.candidateQ, candidateQ);
+    session.dispose();
   });
 });
 
-describe('deterministic simulation contract', () => {
-  test('uses canonical initialization for a single leaf and returns no anchor placement or spring', () => {
-    const entities = buildSingleRootLeafHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
+describe('exact convergence and cooling budgets', () => {
+  test('requires three real unchanged epochs, locks in a numbered tick, keeps anchors mobile, and passes eight steps', () => {
+    const session = createForceLayoutSession(request());
+    for (let step = 1; step <= 11; step += 1) {
+      const frame = session.advanceOneStep();
+      assert.equal(frame.terminal, 'none');
+      assert.equal(session.automaticLock, false);
+    }
+    const lockFrame = session.advanceOneStep();
+    assert.equal(lockFrame.coolingStep, 12);
+    assert.equal(lockFrame.unchangedAssignmentEpochs, 3);
+    assert.equal(session.automaticLock, true);
+    assert.equal(lockFrame.maxTargetError, 0);
+    assert.equal(lockFrame.rmsTargetError, 0);
 
-    assert.deepEqual(result.placements, [{ entityId: 'single-root-leaf', q: 0, r: 0 }]);
-    assert.deepEqual(result.springs, []);
-    assertCompleteUniqueCells(result, entities);
+    const terminal = settle(session);
+    assert.equal(terminal.terminal, 'converged');
+    assert.equal(terminal.coolingStep, 39);
+    assert.equal(terminal.stableStreak, 8);
+    assert.equal(session.leafNodes[0].x, session.leafNodes[0].centerX);
+    assert.equal(session.leafNodes[0].y, session.leafNodes[0].centerY);
+    session.dispose();
   });
 
-  test('sorts equal-order IDs by exact code units and preserves delimiter-containing identities', () => {
-    const rootId = 'root|anchor:target';
-    const ids = ['\u00e4|x', 'z:x', 'e\u0301|x', '\u00e9:x', 'a|x', 'Z:x'];
-    const entities = [
-      { id: rootId, parentId: null, order: -1 },
-      ...ids.map((id) => ({ id, parentId: rootId, order: 4 })),
-    ];
-    const result = calculateForceLayout(makeRequest(entities));
-
-    assert.deepEqual(result.placements.map(({ entityId }) => entityId), [
-      'Z:x',
-      'a|x',
-      'e\u0301|x',
-      'z:x',
-      '\u00e4|x',
-      '\u00e9:x',
-    ]);
-  });
-
-  test('keeps structured spring identities collision-safe when delimiter concatenation would collide', () => {
+  test('keeps anchors mobile and converges when the eighth exact gate passes at step 256', () => {
     const entities = [
       { id: 'root', parentId: null, order: 0 },
-      { id: 'b', parentId: 'root', order: 1 },
-      { id: 'anchor|b', parentId: 'root', order: 2 },
-      { id: 'a|anchor', parentId: 'b', order: 3 },
-      { id: 'a', parentId: 'anchor|b', order: 4 },
+      { id: 'group', parentId: 'root', order: 1 },
+      { id: 'leaf-a', parentId: 'group', order: 2 },
+      { id: 'leaf-b', parentId: 'group', order: 3 },
     ];
-    const result = calculateForceLayout(makeRequest(entities));
-    const leafSprings = result.springs.filter(({ source }) => source.kind === 'leaf');
-
-    assert.deepEqual(leafSprings.map(({ source, target }) => [
-      source.kind,
-      source.entityId,
-      target.kind,
-      target.entityId,
-    ]), [
-      ['leaf', 'a|anchor', 'anchor', 'b'],
-      ['leaf', 'a', 'anchor', 'anchor|b'],
-    ]);
-    assert.equal(
-      new Set(result.springs.map(({ source, target }) => JSON.stringify([
-        source.kind,
-        source.entityId,
-        target.kind,
-        target.entityId,
-      ]))).size,
-      result.springs.length,
-    );
+    const session = createForceLayoutSession(request(entities));
+    const first = session.advanceOneStep();
+    assert.equal(first.coolingStep, 1);
+    assert.ok(session.anchorNodes.every(({ fx, fy }) => fx == null && fy == null));
+    const terminal = settle(session);
+    assert.equal(terminal.terminal, 'converged');
+    assert.equal(terminal.coolingStep, 256);
+    assert.equal(terminal.stableStreak, 8);
+    assert.ok(session.anchorNodes.every(({ fx, fy }) => fx == null && fy == null));
+    session.dispose();
   });
+});
 
-  test('covers every one of 256 manual ticks with the exact alpha phases', () => {
-    const coveredTicks = FORCE_LAYOUT_CONFIG.alphaSchedule.flatMap(({ fromTick, toTick }) => (
-      Array.from({ length: toTick - fromTick + 1 }, (_, index) => fromTick + index)
-    ));
-    assert.deepEqual(coveredTicks, Array.from({ length: 256 }, (_, tick) => tick));
-    assert.equal(alphaAtTick(0), 1);
-    assert.equal(alphaAtTick(159), 0.12);
-    assert.equal(alphaAtTick(160), 0.12);
-    assert.equal(alphaAtTick(223), 0.02);
-    assert.equal(alphaAtTick(224), 0.02);
-    assert.equal(alphaAtTick(255), 0.005);
+describe('mutation-free semantic control rejection', () => {
+  test('advances only the processed sequence for an invalid release and accepts the next sequence', () => {
+    const session = createForceLayoutSession(request());
+    settle(session);
+    const before = snapshotForceState(session);
+    const rejected = session.enqueueControl({
+      requestId: 17,
+      commandSeq: 1,
+      action: 'release-fixed-position',
+      entityId: 'single-root-leaf',
+    });
+    assert.equal(rejected.accepted, false);
+    assert.equal(rejected.error.code, 'NOT_FIXED');
+    assert.equal(session.state.processedCommandSeq, 1);
+    assert.equal(session.state.acceptedCommandSeq, 0);
+    assert.deepEqual(snapshotForceState(session), before);
 
-    const result = calculateForceLayout(makeRequest(buildSmallValidHierarchy()));
-    assert.equal(result.diagnostics.iterations, 256);
-    assert.equal(result.diagnostics.assignmentEpochs, 40);
-  });
-
-  test('creates one anchor per internal entity and one immediate-parent spring per non-root entity', () => {
-    const entities = buildArbitraryDepthHierarchy();
-    const { childCountById, internals } = hierarchyFacts(entities);
-    const result = calculateForceLayout(makeRequest(entities));
-    const expectedSprings = entities
-      .filter(({ parentId }) => parentId !== null)
-      .sort(compareEntities)
-      .map((entity) => [
-        childCountById.get(entity.id) === 0 ? 'leaf' : 'anchor',
-        entity.id,
-        'anchor',
-        entity.parentId,
-      ]);
-    const actualSprings = result.springs.map(({ source, target }) => [
-      source.kind,
-      source.entityId,
-      target.kind,
-      target.entityId,
-    ]);
-    const anchorIds = new Set(result.springs.flatMap(({ source, target }) => [
-      ...(source.kind === 'anchor' ? [source.entityId] : []),
-      target.entityId,
-    ]));
-
-    assert.deepEqual(actualSprings, expectedSprings);
-    assert.equal(result.springs.length, entities.filter(({ parentId }) => parentId !== null).length);
-    assert.deepEqual([...anchorIds].sort(), internals.map(({ id }) => id).sort());
-    assertCompleteUniqueCells(result, entities);
-  });
-
-  test('keeps radius-three assignment proposals bounded and returns complete unique integer cells', () => {
-    const entities = buildGroupingHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
-    const leafCount = hierarchyFacts(entities).leaves.length;
-    const radius = FORCE_LAYOUT_CONFIG.candidateRadius;
-    const candidateCap = 1 + 3 * radius * (radius + 1) + 1;
-
-    assert.equal(radius, 3);
-    assert.equal(candidateCap, 38);
-    assertCompleteUniqueCells(result, entities);
-    assert.ok(Number.isSafeInteger(result.diagnostics.proposalCount));
-    assert.ok(result.diagnostics.proposalCount >= 0);
-    assert.ok(
-      result.diagnostics.proposalCount
-      <= leafCount * candidateCap * result.diagnostics.assignmentEpochs,
-    );
-  });
-
-  test('pins every final leaf endpoint to its exact assigned center and reports finite convergence', () => {
-    const entities = buildArbitraryDepthHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
-    const placementById = new Map(result.placements.map((placement) => [placement.entityId, placement]));
-
-    for (const spring of result.springs) {
-      if (spring.source.kind !== 'leaf') continue;
-      const placement = placementById.get(spring.source.entityId);
-      assert.deepEqual(
-        { q: spring.source.q, r: spring.source.r },
-        { q: placement.q, r: placement.r },
-      );
-    }
-
-    assert.deepEqual(Object.keys(result.diagnostics).sort(), [
-      'assignmentEpochs',
-      'converged',
-      'iterations',
-      'kind',
-      'maxAnchorVelocity',
-      'maxTargetError',
-      'proposalCount',
-      'rmsTargetError',
-    ]);
-    assert.equal(result.diagnostics.kind, 'force');
-    assert.equal(result.diagnostics.converged, true);
-    assert.ok(result.diagnostics.maxTargetError <= FORCE_LAYOUT_CONFIG.convergenceThresholds.maxTargetError);
-    assert.ok(result.diagnostics.rmsTargetError <= FORCE_LAYOUT_CONFIG.convergenceThresholds.rmsTargetError);
-    assert.ok(
-      result.diagnostics.maxAnchorVelocity
-      <= FORCE_LAYOUT_CONFIG.convergenceThresholds.maxAnchorVelocity,
-    );
-    assertFiniteNumbers(result);
-  });
-
-  test('provides typed finite-state, assignment-invariant, and non-convergence failures', () => {
-    for (const code of ['NON_FINITE_STATE', 'ASSIGNMENT_INVARIANT', 'NOT_CONVERGED']) {
-      const details = { phase: 'force-calculation', code };
-      const throwFailure = () => {
-        throw new ForceLayoutError(code, details);
-      };
-      const error = captureCalculationError(throwFailure, code);
-      assert.strictEqual(error.details, details);
-    }
-  });
-
-  test('meets the 80% same-ancestor grouping ratio at every eligible fixture depth', () => {
-    const entities = buildGroupingHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
-    const ratios = groupingRatios(entities, result.placements);
-
-    assert.deepEqual(ratios.map(({ depth }) => depth), [0, 1]);
-    for (const { depth, sameMean, differentMean } of ratios) {
-      assert.ok(
-        sameMean <= differentMean * 0.8,
-        `depth ${depth}: same ${sameMean} must be <= 80% of different ${differentMean}`,
-      );
-    }
-  });
-
-  test('is independent of equivalent input array order', () => {
-    const entities = buildGroupingHierarchy();
-    const first = calculateForceLayout(makeRequest(entities));
-    const reordered = calculateForceLayout(makeRequest([...entities].reverse()));
-
-    assert.deepEqual(reordered, first);
-  });
-
-  test('returns deeply equal complete results across ten runs', () => {
-    const entities = buildGroupingHierarchy();
-    const results = Array.from({ length: 10 }, () => (
-      calculateForceLayout(makeRequest(structuredClone(entities)))
-    ));
-
-    for (const result of results.slice(1)) assert.deepEqual(result, results[0]);
-  });
-
-  test('keeps every anchor within 5 hex cells of its children centroid', () => {
-    const entities = buildGroupingHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
-    const { leaves, internals } = hierarchyFacts(entities);
-    const entityById = new Map(entities.map(e => [e.id, e]));
-    const placementById = new Map(result.placements.map(p => [p.entityId, p]));
-    const springTargetByEntityId = new Map();
-    for (const spring of result.springs) {
-      if (spring.target.kind === 'anchor' && !springTargetByEntityId.has(spring.target.entityId)) {
-        springTargetByEntityId.set(spring.target.entityId, spring.target);
-      }
-    }
-
-    const MAX_ANCHOR_DISTANCE = 5;
-    for (const internal of internals) {
-      const childLeaves = leaves.filter(l => entityById.get(l.id)?.parentId === internal.id);
-      if (childLeaves.length === 0) continue;
-      let sumQ = 0, sumR = 0;
-      for (const leaf of childLeaves) {
-        const p = placementById.get(leaf.id);
-        sumQ += p.q;
-        sumR += p.r;
-      }
-      const centroidQ = sumQ / childLeaves.length;
-      const centroidR = sumR / childLeaves.length;
-      const target = springTargetByEntityId.get(internal.id);
-      assert.ok(target, `anchor ${internal.id} must have a spring target`);
-      const dist = axialDistance({ q: centroidQ, r: centroidR }, { q: target.q, r: target.r });
-      assert.ok(
-        dist <= MAX_ANCHOR_DISTANCE,
-        `anchor ${internal.id} at (${target.q},${target.r}) is ${dist.toFixed(2)} hex cells from children centroid (${centroidQ.toFixed(2)},${centroidR.toFixed(2)}), must be <= ${MAX_ANCHOR_DISTANCE}`,
-      );
-    }
-  });
-
-  test('keeps every spring shorter than 15 hex cells', () => {
-    const entities = buildGroupingHierarchy();
-    const result = calculateForceLayout(makeRequest(entities));
-    const MAX_SPRING_LENGTH = 15;
-    for (let i = 0; i < result.springs.length; i++) {
-      const spring = result.springs[i];
-      const dist = axialDistance(
-        { q: spring.source.q, r: spring.source.r },
-        { q: spring.target.q, r: spring.target.r },
-      );
-      assert.ok(
-        dist <= MAX_SPRING_LENGTH,
-        `spring ${i} (${spring.source.entityId} -> ${spring.target.entityId}) is ${dist.toFixed(2)} hex cells long, must be <= ${MAX_SPRING_LENGTH}`,
-      );
-    }
+    assert.equal(session.enqueueControl({
+      requestId: 17,
+      commandSeq: 2,
+      action: 'set-fixed-position',
+      entityId: 'single-root-leaf',
+      x: 0,
+      y: 0,
+    }), null);
+    const held = session.advanceOneStep();
+    assert.equal(held.controlReceipts[0].accepted, true);
+    assert.equal(session.state.acceptedCommandSeq, 2);
+    assert.equal(held.globalStep, before.globalStep + 1);
+    assert.equal(held.coolingStep, 0);
+    session.dispose();
   });
 });

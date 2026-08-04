@@ -1,0 +1,35 @@
+{
+  "verificationDate": "2026-08-03",
+  "localHost": {
+    "platform": "win32",
+    "arch": "x64",
+    "nodeVersion": "v26.5.0",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz",
+    "totalMemoryGB": 31.3,
+    "freeMemoryGB": 4.2
+  },
+  "detectedVersions": {
+    "playwright": "1.61.1",
+    "chromiumUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/136.0.7103.25 Safari/537.36"
+  },
+  "projectSettings": {
+    "desktop": {
+      "viewport": { "width": 1024, "height": 720 },
+      "deviceScaleFactor": 1,
+      "isMobile": false,
+      "hasTouch": false
+    },
+    "phone": {
+      "viewport": { "width": 360, "height": 800 },
+      "deviceScaleFactor": 1,
+      "isMobile": true,
+      "hasTouch": true
+    },
+    "tablet": {
+      "viewport": { "width": 768, "height": 1024 },
+      "deviceScaleFactor": 1,
+      "isMobile": true,
+      "hasTouch": true
+    }
+  }
+}

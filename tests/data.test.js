@@ -10,6 +10,7 @@ import {
 import {
   STRUCTURAL_MAXIMUM_COUNTS,
   buildCycleHierarchy,
+  buildDepthSeventeenHierarchy,
   buildDuplicateIdHierarchy,
   buildEmptyHierarchy,
   buildMissingParentHierarchy,
@@ -22,7 +23,6 @@ const LIMITS = Object.freeze({
   entityCount: 6000,
   leafCount: 4800,
   internalCount: 1200,
-  maxDepth: 16,
   leafAncestorMembershipCount: 76800,
 });
 
@@ -191,8 +191,11 @@ describe('normalizeHierarchy', () => {
     assertScaleViolation(buildChain(LIMITS.internalCount + 1), 'internalCount', LIMITS.internalCount);
   });
 
-  test('rejects hierarchy depth above the supported limit', () => {
-    assertScaleViolation(buildChain(LIMITS.maxDepth + 1), 'maxDepth', LIMITS.maxDepth);
+  test('accepts a valid depth-17 hierarchy', () => {
+    const { analysis } = normalizeHierarchy(buildDepthSeventeenHierarchy());
+    assert.equal(analysis.counts.maxDepth, 17);
+    assert.equal(analysis.depthByEntityId.get('depth-17-17'), 17);
+    assert.equal(analysis.ancestorIdsByEntityId.get('depth-17-17').length, 17);
   });
 
   test('rejects leaf-to-ancestor memberships above the supported limit', () => {

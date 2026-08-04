@@ -164,29 +164,36 @@ export function quantize(value, step = DEFAULT_QUANTIZATION_STEP) {
   assertFinite(step, 'step');
   if (step <= 0) throw new RangeError('step must be greater than zero.');
 
-  const magnitude = Math.floor(Math.abs(value) / step + 0.5) * step;
-  const result = value < 0 ? -magnitude : magnitude;
+  const result = Math.round(value / step) * step;
   if (!Number.isFinite(result)) throw new RangeError('quantized value must be finite.');
   return normalizeZero(result);
 }
 
 export function axialToPlane(q, r) {
+  return axialToPlaneInto(q, r, {});
+}
+
+export function axialToPlaneInto(q, r, target) {
   assertFinite(q, 'q');
   assertFinite(r, 'r');
-  return {
-    x: normalizeZero(HEX_SIZE * SQRT_3 * (q + r / 2)),
-    z: normalizeZero(HEX_SIZE * 1.5 * r),
-  };
+  if (target === null || typeof target !== 'object') throw new TypeError('target must be an object.');
+  target.x = normalizeZero(HEX_SIZE * SQRT_3 * (q + r / 2));
+  target.z = normalizeZero(HEX_SIZE * 1.5 * r);
+  return target;
 }
 
 /** Convert the pointy-top simulation plane back to fractional axial space. */
 export function planeToAxial(x, z) {
+  return planeToAxialInto(x, z, {});
+}
+
+export function planeToAxialInto(x, z, target) {
   assertFinite(x, 'x');
   assertFinite(z, 'z');
-  return {
-    q: x / (HEX_SIZE * SQRT_3) - z / (HEX_SIZE * 3),
-    r: z / (HEX_SIZE * 1.5),
-  };
+  if (target === null || typeof target !== 'object') throw new TypeError('target must be an object.');
+  target.q = x / (HEX_SIZE * SQRT_3) - z / (HEX_SIZE * 3);
+  target.r = z / (HEX_SIZE * 1.5);
+  return target;
 }
 
 export function fractionalAxialRadius(q, r) {

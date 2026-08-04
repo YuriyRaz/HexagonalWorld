@@ -353,6 +353,8 @@ function createForceIsland(input, stable) {
   }));
   const occupiedTiles = ownership.ownObject(new THREE.InstancedMesh(occupiedGeometry, occupiedMaterial, leafIndices.length));
   const instances = new Array(leafIndices.length);
+  const nextX = new Float32Array(leafIndices.length);
+  const nextZ = new Float32Array(leafIndices.length);
   const baseColors = new Float32Array(leafIndices.length * 3);
   const matrix = new THREE.Matrix4();
   const position = new THREE.Vector3();
@@ -369,18 +371,19 @@ function createForceIsland(input, stable) {
   };
   const applyPosition = (frame, updateBounds = true) => {
     if (!(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2) throw renderFailure('INVALID_FORCE_FRAME');
-    const next = new Array(leafIndices.length);
     for (let index = 0; index < leafIndices.length; index += 1) {
       const nodeIndex = leafIndices[index];
       const x = frame.positions[nodeIndex * 2];
       const z = frame.positions[nodeIndex * 2 + 1];
       if (!Number.isFinite(x) || !Number.isFinite(z)) throw renderFailure('NONFINITE_FORCE_FRAME');
-      const entityId = topology.nodeIds[nodeIndex];
-      const record = instances[index] || getHeight(entityId, index);
-      next[index] = { x, z, record };
+      nextX[index] = x;
+      nextZ[index] = z;
     }
-    for (let index = 0; index < next.length; index += 1) {
-      const { x, z, record } = next[index];
+    for (let index = 0; index < leafIndices.length; index += 1) {
+      const x = nextX[index];
+      const z = nextZ[index];
+      const entityId = topology.nodeIds[leafIndices[index]];
+      const record = instances[index] || getHeight(entityId, index);
       const depth = record.height + 1.4;
       const y = record.height / 2 - 0.62;
       position.set(x, y, z);
@@ -397,6 +400,7 @@ function createForceIsland(input, stable) {
     occupiedTiles.userData = { instances, baseColors, nodeIndices: leafIndices };
     occupiedTiles.instanceMatrix.needsUpdate = true;
     if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
+    occupiedTiles.computeBoundingSphere();
   };
   applyPosition(stable ? terminalFrame : initialFrame);
   occupiedTiles.castShadow = leafIndices.length <= 2500;

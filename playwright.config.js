@@ -37,6 +37,7 @@ const profiles = [
 export default defineConfig({
   timeout: 120000,
   testDir: './tests',
+  testMatch: '**/*.spec.js',
   outputDir: 'test-results',
   reporter: [
     ['list'],
@@ -54,27 +55,21 @@ export default defineConfig({
       })),
     ),
     {
-      name: 'benchmark-chromium',
-      testMatch: '**/layout.benchmark.spec.js',
-      use: {
-        browserName: 'chromium',
-        viewport: { width: 1440, height: 900 },
-        deviceScaleFactor: 1,
-      },
-    },
-    {
       name: 'benchmark-desktop-chromium',
       testMatch: '**/layout.benchmark.spec.js',
+      outputDir: 'test-results/benchmark-desktop',
       use: { browserName: 'chromium', viewport: { width: 1024, height: 720 }, deviceScaleFactor: 1 },
     },
     {
       name: 'benchmark-phone-chromium',
       testMatch: '**/layout.benchmark.spec.js',
+      outputDir: 'test-results/benchmark-phone',
       use: { browserName: 'chromium', viewport: { width: 360, height: 800 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
     },
     {
       name: 'benchmark-tablet-chromium',
       testMatch: '**/layout.benchmark.spec.js',
+      outputDir: 'test-results/benchmark-tablet',
       use: { browserName: 'chromium', viewport: { width: 768, height: 1024 }, deviceScaleFactor: 1, isMobile: true, hasTouch: true },
     },
   ],

@@ -3,8 +3,8 @@ import { calculateForceLayout, createForceLayoutSession } from './force-layout.j
 
 function errorEnvelope(error) {
   return {
-    code: error?.code || 'INTERNAL_ERROR',
-    details: error?.details && typeof error.details === 'object' ? error.details : {},
+    code: error?.code ?? 'INTERNAL_ERROR',
+    details: error?.details != null && typeof error.details === 'object' ? error.details : {},
   };
 }
 
@@ -26,7 +26,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       positions: new Float32Array(frame.positions),
       result: frame.result,
     };
-    state.terminalBuffer = terminalFrame.positions.buffer;
+    state.terminalByteLength = terminalFrame.positions.byteLength;
     if (frame.terminal === 'converged') {
       state.phase = 'settled-awaiting-commit';
       post(postMessage, {
@@ -96,7 +96,13 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
   }
 
   function startV2(request, presentation = 'all-steps') {
-    const session = createForceLayoutSession(request);
+    let session;
+    try {
+      session = createForceLayoutSession(request);
+    } catch (error) {
+      sendFailure(request.requestId, error);
+      return;
+    }
     const state = {
       session,
       requestId: request.requestId,
@@ -105,14 +111,20 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       phase: 'running',
       presentation,
       outstanding: null,
-      terminalBuffer: null,
+      terminalByteLength: 0,
+      lastReceiptGlobalStep: -1,
+      lastSuppressedStep: -1,
     };
     active = state;
 
     if (presentation === 'final-only') {
       try {
-        let frame = session.initialFrame();
-        while (frame.terminal === 'none') frame = session.advanceOneStep();
+        sendFrame(state, session.initialFrame(), 'ready');
+        state.outstanding = null;
+        let frame = state.outstanding?.frame;
+        while (!frame || frame.terminal === 'none') {
+          frame = session.advanceOneStep();
+        }
         if (frame.terminal === 'none') return;
         sendTerminal(state, frame);
       } catch (error) {
@@ -135,7 +147,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       }
       post(postMessage, { type: 'success', requestId: request.requestId, result });
     } catch (error) {
-      post(postMessage, { type: 'failure', requestId: request.requestId, error: errorEnvelope(error) });
+      sendFailure(request.requestId, error);
     }
   }
 
@@ -157,11 +169,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
     if (!active) return;
     const state = active;
     if (message.requestId !== state.requestId) {
-      post(postMessage, {
-        type: 'failure',
-        requestId: message.requestId,
-        error: { code: 'WRONG_REQUEST', details: { expected: state.requestId } },
-      });
+      sendFailure(message.requestId, { code: 'WRONG_REQUEST', details: { expected: state.requestId } });
       return;
     }
     if (message.type === 'painted' || message.type === 'suppress') {
@@ -171,8 +179,35 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
         active = null;
         return;
       }
-      if (message.buffer instanceof ArrayBuffer) {
-        state.outstanding.frame.positions = new Float32Array(message.buffer);
+      if (state.outstanding.frame.epoch !== state.epoch) {
+        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'epoch-mismatch' } });
+        state.session.dispose();
+        active = null;
+        return;
+      }
+      if (message.globalStep < state.lastReceiptGlobalStep) {
+        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'stale-receipt' } });
+        state.session.dispose();
+        active = null;
+        return;
+      }
+      if (message.type === 'painted' && message.globalStep === state.lastSuppressedStep) {
+        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'suppression-race' } });
+        state.session.dispose();
+        active = null;
+        return;
+      }
+      const expectedByteLength = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      if (!(message.buffer instanceof ArrayBuffer) || message.buffer.byteLength !== expectedByteLength) {
+        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'invalid-paint-buffer' } });
+        state.session.dispose();
+        active = null;
+        return;
+      }
+      state.outstanding.frame.positions = new Float32Array(message.buffer);
+      state.lastReceiptGlobalStep = message.globalStep;
+      if (message.type === 'suppress') {
+        state.lastSuppressedStep = message.globalStep;
       }
       afterPaint(state);
       return;
@@ -211,7 +246,11 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       return;
     }
     if (message.type === 'session-result-committed') {
-      if (state.terminalBuffer && message.terminalBuffer && message.terminalBuffer !== state.terminalBuffer) {
+      const expectedByteLength = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      if (message.epoch !== state.epoch
+        || !(message.terminalBuffer instanceof ArrayBuffer)
+        || message.terminalBuffer.byteLength !== state.terminalByteLength
+        || message.terminalBuffer.byteLength !== expectedByteLength) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'terminal-buffer-mismatch' } });
         state.session.dispose();
         active = null;
@@ -220,7 +259,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       state.phase = 'retained-settled';
       state.epoch = message.epoch ?? state.session.state.epoch;
       state.session.state.phase = 'settled';
-      state.terminalBuffer = null;
+      state.terminalByteLength = 0;
       return;
     }
     if (message.type === 'cancel' || message.type === 'dispose') {

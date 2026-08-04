@@ -146,6 +146,17 @@ export function buildArbitraryDepthHierarchy() {
   ];
 }
 
+export function buildDepthSeventeenHierarchy() {
+  const entities = [{ id: 'depth-17-root', parentId: null, order: 0 }];
+  let parentId = entities[0].id;
+  for (let depth = 1; depth <= 17; depth += 1) {
+    const id = `depth-17-${padded(depth, 2)}`;
+    entities.push({ id, parentId, order: depth });
+    parentId = id;
+  }
+  return entities;
+}
+
 export function buildGroupingHierarchy() {
   return buildDepthTwoForest('grouping', 2, 2, 4);
 }

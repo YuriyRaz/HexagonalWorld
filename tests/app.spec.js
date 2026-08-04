@@ -119,7 +119,7 @@ async function expectReachable(locator, viewport) {
   expect(receivesHit).toBe(true);
 }
 
-test.describe('US1 portable force-directed application', { tag: ['@us1', '@portable'] }, () => {
+test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-force', '@portable'] }, () => {
   test('offers force anchors with associated explanatory and live status semantics', async ({ page }) => {
     await openApp(page);
     await expectTestApi(page);
@@ -256,6 +256,60 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
     const afterSettling = await getState(page);
     expect(afterSettling.activeRootId).toBe(committed.activeRootId);
     expect(afterSettling.activeResult).toEqual(committed.activeResult);
+  });
+
+  test('hides the tab with one outstanding frame and restores the same frame', { tag: ['@US2-usable-lifecycle'] }, async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await configureNextRequest(page, { entities: buildSmallValidHierarchy(), delayMs: 500 });
+    await page.locator('#layout-algorithm').selectOption(FORCE_MODE);
+
+    await expect.poll(async () => {
+      const s = await getState(page);
+      return s.busy;
+    }).toBe(true);
+
+    const beforeHide = await getState(page);
+    expect(beforeHide.busy).toBe(true);
+
+    await page.evaluate(() => window.__hexWorldTest.setPresentationPaused(true));
+
+    const pausedState = await getState(page);
+    expect(pausedState.busy).toBe(true);
+    expect(pausedState.activeRootId).toBe(beforeHide.activeRootId);
+
+    await page.evaluate(() => window.__hexWorldTest.setPresentationPaused(false));
+
+    await waitForSuccess(page);
+    const afterRestore = await getState(page);
+    expect(afterRestore.busy).toBe(false);
+    expect(afterRestore.activeResult).not.toBeNull();
+  });
+
+  test('dispatches pagehide and asserts runner termination', { tag: ['@US2-usable-lifecycle'] }, async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await configureNextRequest(page, { entities: buildSmallValidHierarchy(), delayMs: 500 });
+    await page.locator('#layout-algorithm').selectOption(FORCE_MODE);
+
+    await expect.poll(async () => {
+      const s = await getState(page);
+      return s.busy;
+    }).toBe(true);
+
+    const beforeHide = await getState(page);
+    expect(beforeHide.busy).toBe(true);
+
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    await expect.poll(async () => {
+      const s = await getState(page);
+      return s.busy;
+    }).toBe(false);
   });
 
   test('commits only the latest request', async ({ page }) => {
@@ -406,7 +460,7 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
     }
   });
 
-  test('restores legacy layouts without stale springs or duplicate roots', { tag: ['@us3'] }, async ({ page }) => {
+  test('restores legacy layouts without stale springs or duplicate roots', { tag: ['@US3-deterministic-reduced-motion'] }, async ({ page }) => {
     test.setTimeout(120_000);
     await openApp(page);
     await expectTestApi(page);
@@ -471,7 +525,69 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
     expect((await page.evaluate(() => window.__hexWorldTest.getRenderSummary())).worldChildCount).toBe(1);
   });
 
-  test('supports spring rendering and visual presets under visual projects', { tag: ['@us2', '@visual'] }, async ({ page }, testInfo) => {
+  test('produces identical final results under reduced-motion and normal-motion', { tag: ['@US3-deterministic-reduced-motion'] }, async ({ page }) => {
+    const entities = buildSmallValidHierarchy();
+
+    await openApp(page);
+    await expectTestApi(page);
+
+    await selectForce(page, { entities, delayMs: 80 });
+    await waitForSuccess(page);
+    const normalResult = await getState(page);
+
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await openApp(page);
+    await expectTestApi(page);
+
+    await selectForce(page, { entities, delayMs: 80 });
+    await waitForSuccess(page);
+    const reducedResult = await getState(page);
+
+    expect(reducedResult.activeResult.mode).toBe(normalResult.activeResult.mode);
+    expect(reducedResult.activeResult.placements).toEqual(normalResult.activeResult.placements);
+    expect(reducedResult.activeResult.springs).toEqual(normalResult.activeResult.springs);
+    expect(reducedResult.activeResult.diagnostics).toEqual(normalResult.activeResult.diagnostics);
+  });
+
+  test('proves no drag or simulation mutation from pointer gestures', { tag: ['@US2-usable-lifecycle'] }, async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await selectForce(page, { delayMs: 80 });
+    await waitForSuccess(page);
+
+    const beforeGesture = await getState(page);
+    expect(beforeGesture.busy).toBe(false);
+
+    await page.evaluate(() => {
+      const canvas = document.querySelector('#world');
+      const coords = [
+        { type: 'pointerdown', x: 200, y: 200 },
+        { type: 'pointermove', x: 400, y: 300 },
+        { type: 'pointerup', x: 400, y: 300 },
+      ];
+      for (const c of coords) {
+        canvas.dispatchEvent(new PointerEvent(c.type, {
+          bubbles: true,
+          cancelable: true,
+          pointerType: 'mouse',
+          clientX: c.x,
+          clientY: c.y,
+          button: 0,
+          pointerId: 1,
+        }));
+      }
+    });
+
+    await page.waitForTimeout(200);
+
+    const afterGesture = await getState(page);
+    expect(afterGesture.busy).toBe(false);
+    expect(afterGesture.activeRootId).toBe(beforeGesture.activeRootId);
+    expect(afterGesture.activeResult).toEqual(beforeGesture.activeResult);
+  });
+
+  test('supports spring rendering and visual presets under visual projects', { tag: ['@US2-usable-lifecycle', '@visual'] }, async ({ page }, testInfo) => {
     const projectName = testInfo.project.name;
     const isVisual = projectName.startsWith('visual-');
     test.skip(!isVisual, 'This test only runs under visual projects.');
@@ -707,5 +823,55 @@ test.describe('US1 portable force-directed application', { tag: ['@us1', '@porta
     expect(testResults.hoverContrast).toBeGreaterThanOrEqual(3.0);
     expect(testResults.selectionContrast).toBeGreaterThanOrEqual(3.0);
     expect(testResults.opaqueOcclusionMaxDiff).toBeLessThanOrEqual(5);
+  });
+
+  test('asserts detected browser and Playwright profile settings per project', async ({ page, browserName }, testInfo) => {
+    testInfo.annotations.push({
+      type: 'evidence-scope',
+      description: 'Local Chromium viewport/touch emulation only. NOT native Android, iOS, or hardware device evidence.',
+    });
+
+    const deviceClass = testInfo.project.name.split('-')[0];
+    const profile = DEVICE_PROFILES[deviceClass];
+    expect(profile, `Profile for ${testInfo.project.name}`).toBeTruthy();
+
+    expect(browserName).toBe('chromium');
+
+    const browserVersion = await page.evaluate(() => navigator.userAgent);
+    expect(browserVersion).toMatch(/Chrome\/\d+/);
+
+    const pwVersion = await test.info().config?.version;
+    testInfo.annotations.push({ type: 'playwright-version', description: String(pwVersion ?? 'unknown') });
+
+    await openApp(page);
+
+    const metrics = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      visualViewportWidth: window.visualViewport?.width ?? null,
+      devicePixelRatio: window.devicePixelRatio,
+    }));
+
+    expect(metrics.innerWidth).toBe(profile.viewport.width);
+    expect(metrics.visualViewportWidth).toBe(profile.viewport.width);
+
+    const projectUse = testInfo.project.use;
+    const expectedDpr = projectUse.deviceScaleFactor ?? 1;
+    expect(metrics.devicePixelRatio).toBe(expectedDpr);
+
+    const isMobileProject = projectUse.isMobile === true;
+    const hasTouch = projectUse.hasTouch === true;
+
+    if (deviceClass === 'desktop') {
+      expect(isMobileProject).toBe(false);
+      expect(hasTouch).toBe(false);
+    } else {
+      expect(isMobileProject).toBe(true);
+      expect(hasTouch).toBe(true);
+    }
+
+    testInfo.annotations.push({
+      type: 'profile-summary',
+      description: `${deviceClass}: ${profile.viewport.width}x${profile.viewport.height}, dpr=${expectedDpr}, mobile=${isMobileProject}, touch=${hasTouch}`,
+    });
   });
 });

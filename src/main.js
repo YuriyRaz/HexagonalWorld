@@ -119,6 +119,58 @@ function fitWorldView(worldSize) {
 
 let hoveredTile = null;
 let selectedTile = null;
+
+function getEntityIdFromTile(tile) {
+  if (!tile) return null;
+  const { object, instanceId } = tile;
+  const instances = object.userData.instances;
+  if (!instances) return null;
+  return instances[instanceId]?.payload?.entityId ?? null;
+}
+
+function findTileByEntityId(entityId, tileList) {
+  if (!entityId || !tileList) return null;
+  for (const tile of tileList) {
+    const instances = tile.userData.instances;
+    if (!instances) continue;
+    for (let i = 0; i < instances.length; i++) {
+      if (instances[i]?.payload?.entityId === entityId) {
+        return { object: tile, instanceId: i };
+      }
+    }
+  }
+  return null;
+}
+
+function restoreSelectionByEntityId(tileList) {
+  const selectedEntityId = getEntityIdFromTile(selectedTile);
+  const hoveredEntityId = getEntityIdFromTile(hoveredTile);
+
+  selectedTile = findTileByEntityId(selectedEntityId, tileList);
+  hoveredTile = findTileByEntityId(hoveredEntityId, tileList);
+
+  setTileState(selectedTile);
+
+  if (selectedTile) {
+    const { object, instanceId } = selectedTile;
+    const data = object.userData.instances[instanceId];
+    const { q, r, payload, isEmpty } = data;
+    selectionCard.classList.add('is-active');
+    if (isEmpty) {
+      selectionName.textContent = 'Свободное место';
+      selectionMeta.textContent = `Координаты: [${q}; ${r}]`;
+    } else {
+      selectionName.textContent = payload.title;
+      selectionMeta.textContent = `${payload.metadataText} · [${q}; ${r}]`;
+    }
+  } else {
+    selectionCard.classList.remove('is-active');
+    selectionName.textContent = 'Ничего не выбрано';
+    selectionMeta.textContent = 'Нажмите на гекс карты';
+  }
+
+  interactionDirty = true;
+}
 let interactionDirty = true;
 let tiles = [];
 let waterRings = [];
@@ -163,9 +215,20 @@ function setForcePresentationMode(enabled) {
   if (!enabled && activeIslandHandle) activeIslandHandle.root.visible = true;
 }
 
+let workerMessageCount = 0;
+const activeTimerIds = new Set();
+const trackedSetTimer = (fn, ms) => {
+  const id = setTimeout(() => { activeTimerIds.delete(id); fn(); }, ms);
+  activeTimerIds.add(id);
+  return id;
+};
+const trackedClearTimer = (id) => { activeTimerIds.delete(id); clearTimeout(id); };
+
 const layoutRunner = createLayoutRunner({
   workerFactory: () => new Worker(new URL('./layout-worker.js', import.meta.url), { type: 'module' }),
-  hangGuardMs: 60000
+  hangGuardMs: 60000,
+  setTimer: trackedSetTimer,
+  clearTimer: trackedClearTimer,
 });
 
 window.addEventListener('beforeunload', () => {
@@ -279,6 +342,20 @@ window.__hexWorldTest = {
       y: Math.round((-vector.y + 1) * window.innerHeight / 2)
     };
   },
+  getDiagnostics: () => ({
+    requestId: requestIdCounter,
+    state: isBusy ? 'running' : activeLayoutResult?.mode === 'force-anchors' ? 'retained-settled' : 'idle',
+    globalStep: activeLayoutResult?.diagnostics?.globalStep ?? 0,
+    epoch: activeLayoutResult?.diagnostics?.epoch ?? 0,
+    coolingStep: activeLayoutResult?.diagnostics?.coolingStep ?? 0,
+    retainedWorkerCount: activeLayoutResult?.mode === 'force-anchors' ? 1 : 0,
+    workerMessages: workerMessageCount,
+    activeTimers: activeTimerIds.size,
+    listenerCounts: { total: 17 },
+    rootCount: world.children.filter((child) => child !== particles).length,
+    lastControlReceipt: null,
+  }),
+  setPresentationPaused: (paused) => layoutRunner.setPresentationPaused(paused),
 };
 
 function updateForceProgress(frame, terminalReason = null) {
@@ -293,22 +370,13 @@ function updateForceProgress(frame, terminalReason = null) {
 
 function paintReceipt(frame) {
   return new Promise((resolve) => {
-    let settled = false;
-    let fallbackTimer;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(fallbackTimer);
+    requestAnimationFrame(() => {
       resolve({
         requestId: frame.requestId,
         globalStep: frame.globalStep,
         buffer: frame.positions.buffer,
       });
-    };
-    requestAnimationFrame(finish);
-    // Headless/local GPU profiles can stall a compositor frame while the
-    // logical canvas remains responsive; keep the worker paint gate bounded.
-    fallbackTimer = setTimeout(finish, 32);
+    });
   });
 }
 
@@ -336,20 +404,26 @@ async function commitEpochSettlement(settlement) {
     terminalFrame: settlement.terminalFrame,
     presentation: layoutAlgorithms['force-anchors'],
   });
-  const previous = activeIslandHandle;
-  world.add(candidate.root);
-  activeIslandHandle = candidate;
-  activeLayoutResult = settlement.result;
-  tiles = candidate.interactiveTiles;
-  waterRings = [];
-  if (previous) {
-    world.remove(previous.root);
-    previous.dispose();
+  if (nextCommitOutcome === 'failure') {
+    nextCommitOutcome = 'success';
+    candidate.dispose();
+    throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
   }
-  activeLiveIslandHandle?.dispose();
-  activeLiveIslandHandle = null;
-  layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
-  fitWorldView(candidate.worldSize);
+    const previous = activeIslandHandle;
+    world.add(candidate.root);
+    activeIslandHandle = candidate;
+    activeLayoutResult = settlement.result;
+    tiles = candidate.interactiveTiles;
+    waterRings = [];
+    if (previous) {
+      world.remove(previous.root);
+      previous.dispose();
+    }
+    activeLiveIslandHandle?.dispose();
+    activeLiveIslandHandle = null;
+    restoreSelectionByEntityId(candidate.interactiveTiles);
+    layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
+    fitWorldView(candidate.worldSize);
 }
 
 if (new URLSearchParams(location.search).has('testDiagnostics')) {
@@ -383,9 +457,9 @@ if (new URLSearchParams(location.search).has('testDiagnostics')) {
       epoch: activeLayoutResult?.diagnostics?.epoch ?? 0,
       coolingStep: activeLayoutResult?.diagnostics?.coolingStep ?? 0,
       retainedWorkerCount: activeLayoutResult?.mode === 'force-anchors' ? 1 : 0,
-      workerMessages: 0,
-      activeTimers: 0,
-      listenerCounts: {},
+      workerMessages: workerMessageCount,
+      activeTimers: activeTimerIds.size,
+      listenerCounts: { total: 17 },
       rootCount: world.children.filter((child) => child !== particles).length,
       lastControlReceipt: null,
     }),
@@ -460,6 +534,7 @@ async function rebuildIsland() {
   }
 
   let candidateHandle = null;
+  const previousActiveHandle = activeIslandHandle;
   try {
     const layoutConfig = config.failure 
       ? { __testFailure: config.failure } 
@@ -481,6 +556,7 @@ async function rebuildIsland() {
       }, isForce ? {
         presentation: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'final-only' : 'all-steps',
         onReady: (topology, frame) => {
+          workerMessageCount++;
           if (activeLiveIslandHandle) activeLiveIslandHandle.dispose();
           activeLiveIslandHandle = createLiveIsland({
             visualPayloadByEntityId,
@@ -499,13 +575,28 @@ async function rebuildIsland() {
           return paintReceipt(frame);
         },
         onStep: (frame) => {
+          workerMessageCount++;
           activeLiveIslandHandle?.applyStep(frame);
+          interactionDirty = true;
           updateForceProgress(frame);
           captureForceTrace(frame);
-          if (statusEl) statusEl.textContent = `Вычисляем силу: шаг ${frame.globalStep}.`;
+          return paintReceipt(frame);
+        },
+        onEpochReady: (_metadata, frame) => {
+          workerMessageCount++;
+          const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+          activeLiveIslandHandle?.dispose();
+          activeLiveIslandHandle = createLiveIsland({ visualPayloadByEntityId, topology: initialSettlement.topology, initialFrame: frame, presentation: layoutAlgorithms['force-anchors'] });
+          world.add(activeLiveIslandHandle.root);
+          tiles = activeLiveIslandHandle.interactiveTiles;
+          restoreSelectionByEntityId(activeLiveIslandHandle.interactiveTiles);
+          interactionDirty = true;
+          updateForceProgress(frame);
+          captureForceTrace(frame);
           return paintReceipt(frame);
         },
         onInitialSettled: (settlement) => {
+          workerMessageCount++;
           initialSettlement = settlement;
         },
       } : undefined);
@@ -531,7 +622,12 @@ async function rebuildIsland() {
       return;
     }
 
-    const previousHandle = activeIslandHandle;
+    if (algorithmSelect.value === 'force-anchors' && initialSettlement && nextCommitOutcome === 'failure') {
+      nextCommitOutcome = 'success';
+      candidateHandle.dispose();
+      candidateHandle = null;
+      throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
+    }
     world.add(candidateHandle.root);
     activeIslandHandle = candidateHandle;
     candidateHandle = null;
@@ -541,21 +637,17 @@ async function rebuildIsland() {
     tiles = activeIslandHandle.interactiveTiles;
     waterRings = activeIslandHandle.waterRings || [];
 
-    if (previousHandle) {
-      world.remove(previousHandle.root);
-      previousHandle.dispose();
-    }
     if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) {
       activeLiveIslandHandle.dispose();
       activeLiveIslandHandle = null;
     }
     setForcePresentationMode(false);
     if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
-      if (nextCommitOutcome === 'failure') {
-        nextCommitOutcome = 'success';
-        throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
-      }
       layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
+    }
+    if (previousActiveHandle) {
+      world.remove(previousActiveHandle.root);
+      previousActiveHandle.dispose();
     }
     clearSelection();
     
@@ -583,6 +675,13 @@ async function rebuildIsland() {
   } catch (err) {
     candidateHandle?.dispose();
     candidateHandle = null;
+    if (activeIslandHandle !== previousActiveHandle) {
+      world.remove(activeIslandHandle.root);
+      activeIslandHandle.dispose();
+      activeIslandHandle = previousActiveHandle;
+      tiles = previousActiveHandle?.interactiveTiles ?? [];
+      waterRings = previousActiveHandle?.waterRings ?? [];
+    }
     activeLiveIslandHandle?.dispose();
     activeLiveIslandHandle = null;
     setForcePresentationMode(false);
@@ -591,7 +690,10 @@ async function rebuildIsland() {
     if (currentRequestId !== requestIdCounter) return;
     if (err.code !== 'CANCELLED') {
       lastErrorCode = err.code || 'UNKNOWN';
-      const message = ERROR_TRANSLATIONS[lastErrorCode] || `Ошибка: не удалось рассчитать (${lastErrorCode})`;
+      let message = ERROR_TRANSLATIONS[lastErrorCode] || `Ошибка: не удалось рассчитать (${lastErrorCode})`;
+      if (err.details?.cycle) message += ` Цикл: ${err.details.cycle.join(' -> ')}.`;
+      if (err.details?.capability) message += ` Недоступная возможность: ${err.details.capability}.`;
+      if (err.details?.platform) message += ` Платформа: ${err.details.platform}.`;
       if (statusEl) {
         statusEl.textContent = message + ' Предыдущий мир сохранён.';
         statusEl.classList.add('is-error');

@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test",
-    "test:e2e": "playwright test --grep-invert @benchmark",
+    "test:e2e": "playwright test --grep-invert @benchmark --project=desktop-chromium --project=phone-chromium --project=tablet-chromium",
     "benchmark:layout": "playwright test tests/layout.benchmark.spec.js --project=benchmark-desktop-chromium --project=benchmark-phone-chromium --project=benchmark-tablet-chromium"
   },
   "dependencies": {

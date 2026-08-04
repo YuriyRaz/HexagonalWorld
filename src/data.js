@@ -20,7 +20,6 @@ const HIERARCHY_LIMITS = Object.freeze({
   entityCount: 6000,
   leafCount: 4800,
   internalCount: 1200,
-  maxDepth: 16,
   leafAncestorMembershipCount: 76800,
   activeLinkCount: 5999,
 });

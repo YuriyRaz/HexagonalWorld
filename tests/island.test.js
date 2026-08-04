@@ -3,7 +3,7 @@ import { describe, test } from 'node:test';
 
 import * as THREE from 'three';
 
-import { createIsland } from '../src/island.js';
+import { createIsland, createLiveIsland } from '../src/island.js';
 
 const GENERIC_PAYLOAD_FIELDS = [
   'entityId',
@@ -463,6 +463,96 @@ describe('createIsland object model', () => {
       assert.ok([...materialDisposals.values()].every((count) => count === 1));
     } finally {
       legacyHandle.dispose();
+    }
+  });
+});
+
+describe('createLiveIsland and applyStep', () => {
+  function makeForceInput(positions, globalStep = 0) {
+    const topology = {
+      requestId: 1,
+      nodeIds: ['entity-alpha', 'entity-beta'],
+      nodeKinds: ['leaf', 'leaf'],
+      relations: [],
+    };
+    const initialFrame = {
+      requestId: 1,
+      globalStep,
+      positions: new Float32Array(positions),
+    };
+    return {
+      visualPayloadByEntityId: makePayloadMap(),
+      topology,
+      initialFrame,
+      presentation: { occupiedOpacity: 0.5, showSprings: false },
+    };
+  }
+
+  test('createLiveIsland creates valid instances with correct entityId mapping', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      assert.ok(handle.root instanceof THREE.Group);
+      assert.equal(handle.interactiveTiles.length, 1);
+      const occupied = handle.interactiveTiles[0];
+      assert.ok(occupied instanceof THREE.InstancedMesh);
+      assert.equal(occupied.count, 2);
+      assert.equal(occupied.userData.instances.length, 2);
+      assert.equal(occupied.userData.instances[0].entityId, 'entity-alpha');
+      assert.equal(occupied.userData.instances[1].entityId, 'entity-beta');
+      assert.ok(occupied.boundingSphere !== null);
+      assert.ok(occupied.boundingSphere.radius > 0);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('applyStep updates positions and recomputes bounding sphere', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      const occupied = handle.interactiveTiles[0];
+      const sphereBefore = occupied.boundingSphere.clone();
+
+      handle.applyStep({
+        requestId: 1,
+        globalStep: 1,
+        positions: new Float32Array([1, 2, 6, 5]),
+      });
+
+      assert.ok(occupied.boundingSphere.radius > 0);
+      assert.notEqual(occupied.boundingSphere.center.x, sphereBefore.center.x, 'bounding sphere center must change after step');
+      assert.notEqual(occupied.boundingSphere.center.z, sphereBefore.center.z, 'bounding sphere center must change after step');
+      assert.equal(occupied.userData.instances[0].x, 1);
+      assert.equal(occupied.userData.instances[0].z, 2);
+      assert.equal(occupied.userData.instances[1].x, 6);
+      assert.equal(occupied.userData.instances[1].z, 5);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('applyStep rejects non-sequential globalStep', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      assert.throws(
+        () => handle.applyStep({ requestId: 1, globalStep: 5, positions: new Float32Array([0, 0, 5, 3]) }),
+        /Island rendering failed./,
+      );
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('instance payload entityId matches topology nodeIds for raycast lookup', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      const occupied = handle.interactiveTiles[0];
+      const instances = occupied.userData.instances;
+      for (let i = 0; i < instances.length; i++) {
+        assert.equal(instances[i].payload.entityId, `entity-${i === 0 ? 'alpha' : 'beta'}`);
+        assert.equal(instances[i].entityId, instances[i].payload.entityId);
+      }
+    } finally {
+      handle.dispose();
     }
   });
 });

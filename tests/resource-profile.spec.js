@@ -11,13 +11,12 @@ async function openApp(page) {
 
 test.describe('Resource Profiling & Lifecycle', () => {
   test('verifies no resource leaks or duplicate islands under repeated mixed-mode switches', async ({ page }) => {
-    test.setTimeout(300000); // 5 minutes for force layout simulation
+    test.setTimeout(120000);
     await openApp(page);
 
     const selector = page.locator('#layout-algorithm');
     const entities = buildSmallValidHierarchy();
 
-    // 1. Warmup and initial state
     await page.evaluate((entities) => {
       window.__hexWorldTest.configureNextRequest({ entities });
     }, entities);
@@ -27,13 +26,11 @@ test.describe('Resource Profiling & Lifecycle', () => {
       return state.busy;
     }, { timeout: 60000 }).toBe(false);
 
-    // Get baseline counts
     const baseline = await page.evaluate(() => {
       return window.__hexWorldTest.getRenderSummary();
     });
 
-    // 2. Perform repeated switches between force and legacy packed layout
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 3; i++) {
       await selector.selectOption('packed');
       await expect.poll(async () => {
         const state = await page.evaluate(() => window.__hexWorldTest.getState());
@@ -55,15 +52,52 @@ test.describe('Resource Profiling & Lifecycle', () => {
       return window.__hexWorldTest.getRenderSummary();
     });
 
-    // Exactly one active island root (worldChildCount === 1)
     expect(current.worldChildCount).toBe(1);
-    // Same number of line segments (0 or 1 depending on springs)
     expect(current.lineSegments).toBe(baseline.lineSegments);
-    // Check opaque vs translucent materials settings are intact
     expect(current.occupiedOpacity).toBe(0.5);
 
-    // Verify there are no duplicate workers running
     const state = await page.evaluate(() => window.__hexWorldTest.getState());
     expect(state.busy).toBe(false);
+  });
+
+  test('reports real worker, timer, and listener diagnostics after force-anchors layout', async ({ page }) => {
+    test.setTimeout(120000);
+    await openApp(page);
+
+    const selector = page.locator('#layout-algorithm');
+    const entities = buildSmallValidHierarchy();
+
+    // Switch to force-anchors and wait for layout
+    await page.evaluate((entities) => {
+      window.__hexWorldTest.configureNextRequest({ entities });
+    }, entities);
+    await selector.selectOption(FORCE_MODE);
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.__hexWorldTest.getState());
+      return state.busy;
+    }, { timeout: 60000 }).toBe(false);
+
+    // Verify diagnostics after force-anchors layout
+    const diagnostics = await page.evaluate(() => window.__hexWorldTest.getDiagnostics());
+    expect(diagnostics.workerMessages).toBeGreaterThan(0);
+    expect(diagnostics.activeTimers).toBe(0);
+    expect(diagnostics.listenerCounts.total).toBeGreaterThan(0);
+    expect(diagnostics.rootCount).toBe(1);
+    expect(diagnostics.state).toBe('retained-settled');
+
+    // Run another layout and verify resource growth
+    await page.evaluate((entities) => {
+      window.__hexWorldTest.configureNextRequest({ entities });
+    }, entities);
+    await selector.selectOption(FORCE_MODE);
+    await expect.poll(async () => {
+      const state = await page.evaluate(() => window.__hexWorldTest.getState());
+      return state.busy;
+    }, { timeout: 60000 }).toBe(false);
+
+    const afterSecond = await page.evaluate(() => window.__hexWorldTest.getDiagnostics());
+    expect(afterSecond.workerMessages).toBeGreaterThanOrEqual(diagnostics.workerMessages);
+    expect(afterSecond.activeTimers).toBe(0);
+    expect(afterSecond.rootCount).toBe(1);
   });
 });

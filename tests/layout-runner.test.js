@@ -262,8 +262,10 @@ function assertWorkerCleaned(worker, timers) {
     ));
     assert.equal(matchingRemovals.length, 1, `${type} listener must be removed exactly once`);
   }
-  assert.equal(timers.setCalls.length, 1);
-  assert.deepEqual(timers.clearCalls, [timers.setCalls[0]]);
+  assert.ok(timers.setCalls.length >= 1, 'expected at least one timer to be set');
+  for (const setTimer of timers.setCalls) {
+    assert.ok(setTimer.cleared, `timer ${setTimer.id} must be cleared`);
+  }
   assert.equal(worker.terminateCalls, 1);
 }
 
@@ -635,4 +637,181 @@ describe('cancellation and ownership', () => {
       assertWorkerCleaned(worker, timers);
     });
   }
+});
+
+describe('command receipt guards', () => {
+  function buildV2Request(requestId) {
+    return {
+      requestId,
+      mode: FORCE_MODE,
+      entities: [
+        { id: 'root', parentId: null, order: 0 },
+        { id: 'leaf-a', parentId: 'root', order: 1 },
+      ],
+      config: { version: 2 },
+    };
+  }
+
+  function buildV2Topology(requestId) {
+    return {
+      requestId,
+      nodeIds: ['root', 'leaf-a'],
+      nodeKinds: ['anchor', 'leaf'],
+      relations: [{ sourceIndex: 1, targetIndex: 0, relationshipId: 'rel-1' }],
+    };
+  }
+
+  function buildV2ReadyResponse(requestId) {
+    return {
+      type: 'ready',
+      requestId,
+      globalStep: 0,
+      epoch: 0,
+      coolingStep: 0,
+      topology: buildV2Topology(requestId),
+      positions: new Float32Array([0, 0, 0, 0]),
+      terminal: 'none',
+      assignmentRevision: 0,
+      assignmentHash: 0,
+      stableStreak: 0,
+      maxMovement: 0,
+      rmsMovement: 0,
+      maxTargetError: 0,
+      rmsTargetError: 0,
+    };
+  }
+
+  function buildV2SuccessResponse(requestId) {
+    const result = {
+      requestId,
+      mode: FORCE_MODE,
+      placements: [{ entityId: 'leaf-a', q: 0, r: 0 }],
+      springs: [{
+        source: { kind: 'leaf', entityId: 'leaf-a', q: 0, r: 0 },
+        target: { kind: 'anchor', entityId: 'root', q: 0, r: 0 },
+      }],
+      gridRadius: 1,
+      stats: { occupiedCount: 1, boundaryGaps: [] },
+      diagnostics: { version: 2, globalStep: 1, assignmentHash: 0 },
+    };
+    const terminalFrame = {
+      requestId,
+      globalStep: 1,
+      epoch: 0,
+      epochStep: 0,
+      coolingStep: 1,
+      positions: new Float32Array([0, 0, 0, 0]),
+      terminal: 'converged',
+      result,
+    };
+    return { type: 'success', requestId, globalStep: 1, result, terminalFrame };
+  }
+
+  async function reachRetainedSettled(runner, workers, requestId) {
+    const layoutPromise = runner.runLayout(buildV2Request(requestId));
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    worker.emitMessage(buildV2SuccessResponse(requestId));
+    await layoutPromise;
+    runner.confirmSessionResultCommitted(requestId);
+    return worker;
+  }
+
+  test('expired command guard timer rejects caller with CONTROL_TIMEOUT', async () => {
+    const requestId = 801;
+    const { runner, workers, timers } = makeHarness({ hangGuardMs: 50 });
+    const worker = await reachRetainedSettled(runner, workers, requestId);
+
+    const submitPromise = runner.submitForceControl({
+      requestId,
+      action: 'set-fixed-position',
+      entityId: 'leaf-a',
+      x: 1,
+      y: 2,
+    });
+
+    const commandTimer = timers.setCalls.at(-1);
+    assert.equal(commandTimer.delay, 50);
+    timers.fire(commandTimer);
+
+    await assert.rejects(submitPromise, (error) => {
+      assertOperationError(error, {
+        requestId,
+        code: 'CONTROL_TIMEOUT',
+        silent: false,
+      });
+      return true;
+    });
+  });
+
+  test('command guard excludes hidden time from the visible-active-time budget', async () => {
+    const requestId = 802;
+    const { runner, workers, timers } = makeHarness({ hangGuardMs: 100 });
+    const worker = await reachRetainedSettled(runner, workers, requestId);
+
+    const submitPromise = runner.submitForceControl({
+      requestId,
+      action: 'set-fixed-position',
+      entityId: 'leaf-a',
+      x: 1,
+      y: 2,
+    });
+
+    const commandTimer = timers.setCalls.at(-1);
+    assert.equal(commandTimer.delay, 100);
+
+    runner.setPresentationPaused(true);
+    assert.equal(commandTimer.cleared, true);
+
+    const rearmTimer = timers.setCalls.at(-1);
+    assert.equal(rearmTimer.delay, 100);
+
+    runner.setPresentationPaused(false);
+    assert.equal(rearmTimer.cleared, true);
+
+    const finalTimer = timers.setCalls.at(-1);
+    assert.equal(finalTimer.delay, 100);
+
+    worker.emitMessage({
+      type: 'force-control-result',
+      requestId,
+      commandSeq: 1,
+      accepted: true,
+      epoch: 0,
+      appliedAfterGlobalStep: 0,
+      fixedCount: 1,
+    });
+
+    await submitPromise;
+  });
+
+  test('disposal clears the command receipt guard timer', async () => {
+    const requestId = 803;
+    const { runner, workers, timers } = makeHarness({ hangGuardMs: 50 });
+    const layoutPromise = runner.runLayout(buildV2Request(requestId));
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    worker.emitMessage(buildV2SuccessResponse(requestId));
+    await layoutPromise;
+    runner.confirmSessionResultCommitted(requestId);
+
+    const controlPromise = runner.submitForceControl({
+      requestId,
+      action: 'set-fixed-position',
+      entityId: 'leaf-a',
+      x: 1,
+      y: 2,
+    });
+
+    const commandTimer = timers.setCalls.at(-1);
+    assert.equal(commandTimer.cleared, false);
+
+    runner.dispose();
+    assert.equal(commandTimer.cleared, true);
+
+    await assert.rejects(controlPromise, (error) => {
+      assert.equal(error.code, 'CANCELLED');
+      return true;
+    });
+  });
 });

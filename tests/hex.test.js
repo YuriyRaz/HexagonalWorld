@@ -105,13 +105,13 @@ test('rounds fractional axial coordinates through cube-coordinate correction', (
   assert.deepEqual(roundAxial(-0.8, 0.3), { q: -1, r: 0 });
 });
 
-test('quantizes to the nearest step with exact halves away from zero', () => {
+test('quantizes with the canonical Math.round(value / step) * step rule', () => {
   assert.equal(quantize(1.24, 0.5), 1);
   assert.equal(quantize(-1.24, 0.5), -1);
   assert.equal(quantize(1.25, 0.5), 1.5);
-  assert.equal(quantize(-1.25, 0.5), -1.5);
+  assert.equal(quantize(-1.25, 0.5), -1);
   assert.equal(quantize(0.0000005), 0.000001);
-  assert.equal(quantize(-0.0000005), -0.000001);
+  assert.equal(quantize(-0.0000005), 0);
 });
 
 test('converts axial coordinates to the existing pointy-top x/z plane', () => {

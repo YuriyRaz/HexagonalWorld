@@ -93,10 +93,20 @@ This feature introduces a selectable `force-anchors` mode using `d3-force` runni
 
 The retained session is intentionally not connected to pointer, touch, keyboard, selection, camera, or accessibility gestures. Click still selects a tower and existing OrbitControls gestures still control the camera.
 
+### Presentation And Session Lifecycle
+- Normal motion returns each exact frame buffer only after its logical application paint. A hidden tab retains that outstanding frame and pauses active-time guards; restoring the tab paints the same frame without catch-up or dropped steps.
+- Initial and interaction-epoch scene changes are transactions. The committed stable island remains rollback authority until a detached candidate validates and commits; construction, commit, worker, cancellation, or supersession failure restores it.
+- Accepted fixed-position commands begin interaction epochs while global step numbering remains contiguous. Held commands update neighbors without consuming cooling steps. Releasing the final fixed leaf starts a fresh 256-step cooling budget and active-time guard.
+- Commands are rejected before commit, for stale or wrong requests, invalid/non-leaf IDs, non-finite or out-of-radius positions, failed/cancelled/disposed sessions, and invalid sequence ordering. Current UI gestures never submit these commands.
+- Mode switches, rebuilds, superseding requests, commit failures, worker failures, `pagehide`, and disposal release the retained worker, listeners, buffers, guards, and pending command/epoch operations exactly once.
+
 ### Testing and Validation
 Run unit tests, browser tests, and benchmarks using the following scripts:
+- `npm install`: Install the pinned project dependencies.
+- `npm run dev`: Start the local Vite development server for manual validation.
 - `npm test`: Node.js unit tests for pure layout, version-2 sessions, command epochs, worker serialization, and geometry helpers.
 - `npm run test:e2e`: E2E validation of every-step presentation, error handling, reduced motion, camera/selection semantics, and responsive local Chromium profiles.
 - `npm run benchmark:layout`: Performance benchmarks across 1024x720 desktop, 360x800 phone touch emulation, and 768x1024 tablet touch emulation.
+- `npm run build`: Produce the release build after all behavior and benchmark checks pass.
 
 Phone and tablet evidence is local Chromium viewport/touch emulation only. It is not native Android, native browser, hardware, or assistive-technology evidence.

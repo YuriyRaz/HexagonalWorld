@@ -5,61 +5,16 @@ import {
   forceCenter,
 } from 'd3-force';
 import { normalizeHierarchy, HierarchyError } from './data.js';
-import { calculateLayout } from './layout.js';
 import {
-  HEX_SIZE,
   axialToPlane,
+  axialToPlaneInto,
   planeToAxial,
+  planeToAxialInto,
   fractionalAxialRadius,
   ADJACENT_CELL_SPACING,
   quantize,
   axialDistance,
 } from './hex.js';
-
-const alphaScheduleArray = [
-  { fromTick: 0, toTick: 159, from: 1, to: 0.12 },
-  { fromTick: 160, toTick: 223, from: 0.12, to: 0.02 },
-  { fromTick: 224, toTick: 255, from: 0.02, to: 0.005 },
-];
-
-Object.defineProperty(alphaScheduleArray, 'find', {
-  enumerable: false,
-  value: function(predicate) {
-    if (predicate({ fromTick: 223, toTick: 223 })) return { fromTick: 223, toTick: 223, to: 0.02 };
-    if (predicate({ fromTick: 255, toTick: 255 })) return { fromTick: 255, toTick: 255, to: 0.005 };
-    return Array.prototype.find.call(this, predicate);
-  }
-});
-
-export const FORCE_LAYOUT_CONFIG = {
-  version: 1,
-  seed: 0x9e3779b9,
-  totalTicks: 256,
-  mutableEndTick: 159,
-  settleEndTick: 223,
-  assignmentInterval: 4,
-  candidateRadius: 3,
-  predictionLookahead: 0.75,
-  movePenalty: 0.05,
-  alphaSchedule: alphaScheduleArray,
-  velocityDecay: 0.4,
-  hexStrength: { mutable: 0.2, settle: 0.45 },
-  manyBodyStrength: -18,
-  manyBodyTheta: 0.9,
-  manyBodyDistanceMin: 0.1,
-  manyBodyDistanceMax: 32,
-  centerStrength: 0.01,
-  linkDistance: 2,
-  linkStrength: 0.2,
-  linkIterations: 1,
-  quantizationStep: 0.000001,
-  convergenceThresholds: {
-    stableAssignmentEpochs: 3,
-    maxTargetError: 0.25,
-    rmsTargetError: 0.08,
-    maxAnchorVelocity: 0.02,
-  },
-};
 
 function deepFreeze(value) {
   if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -67,7 +22,6 @@ function deepFreeze(value) {
   for (const child of Object.values(value)) deepFreeze(child);
   return value;
 }
-deepFreeze(FORCE_LAYOUT_CONFIG);
 
 export class ForceLayoutError extends Error {
   constructor(code, details) {
@@ -88,250 +42,6 @@ export function mulberry32(a) {
   };
 }
 
-function assertDeepEqualConfig(a, b) {
-  if (!a || !b) return false;
-  if (a.version !== b.version) return false;
-  if (a.hexStrength.settle !== b.hexStrength.settle) return false;
-  return true;
-}
-
-export function calculateForceLayout(request) {
-  if (request.config?.version === 2 && request.config.maxCoolingSteps !== undefined) return calculateForceLayoutV2(request);
-  if (request.mode !== 'force-anchors') {
-    throw new ForceLayoutError('UNKNOWN_MODE', { mode: request.mode });
-  }
-
-  if (request.config?.__testFailure) {
-    const { code, details } = request.config.__testFailure;
-    throw new ForceLayoutError(code, details || {});
-  }
-
-  if (request.config?.delayMs) {
-    const expiry = performance.now() + request.config.delayMs;
-    while (performance.now() < expiry) Math.random();
-  }
-
-  let entities, analysis;
-  try {
-    const res = normalizeHierarchy(request.entities);
-    entities = res.entities;
-    analysis = res.analysis;
-  } catch (e) {
-    if (e instanceof HierarchyError) {
-      throw new ForceLayoutError(e.code, e.details);
-    }
-    throw e;
-  }
-
-  if (!request.config || typeof request.config.version !== 'number' || !assertDeepEqualConfig(request.config, FORCE_LAYOUT_CONFIG)) {
-    throw new ForceLayoutError('INVALID_HIERARCHY', { reason: 'Invalid config drift' });
-  }
-
-  const { leafIds, internalIds, counts, leafToAncestorCount } = analysis;
-
-  if (leafToAncestorCount > 76800) {
-    throw new ForceLayoutError('UNSUPPORTED_SCALE', { measure: 'leafToAncestorCount', limit: 76800, actual: leafToAncestorCount });
-  }
-
-  if (counts.leafCount === 1 && counts.internalCount === 0) {
-    return {
-      requestId: request.requestId,
-      mode: request.mode,
-      placements: [{ entityId: leafIds[0], q: 0, r: 0 }],
-      springs: [],
-      gridRadius: 0,
-      stats: { occupiedCount: 1 },
-      diagnostics: { kind: 'force', iterations: 0, assignmentEpochs: 0, proposalCount: 0, converged: true, maxTargetError: 0, rmsTargetError: 0, maxAnchorVelocity: 0 },
-    };
-  }
-
-  const rng = mulberry32(request.config.seed);
-  const entityById = new Map(entities.map(e => [e.id, e]));
-  const leafSet = new Set(leafIds);
-
-  const layoutReq = { requestId: request.requestId, mode: 'packed', entities: request.entities };
-  const initialLayout = calculateLayout(layoutReq);
-  const placementById = new Map(initialLayout.placements.map(p => [p.entityId, p]));
-
-  const leafNodes = leafIds.map((id) => {
-    const placement = placementById.get(id);
-    const pos = axialToPlane(placement.q, placement.r);
-    return {
-      entityId: id,
-      kind: 'leaf',
-      x: pos.x,
-      y: pos.z,
-      vx: 0,
-      vy: 0,
-      fx: pos.x,
-      fy: pos.z,
-      cellQ: placement.q,
-      cellR: placement.r,
-    };
-  });
-
-  const leafPositionsByParent = new Map();
-  for (const node of leafNodes) {
-    const entity = entityById.get(node.entityId);
-    if (!entity) continue;
-    const parentId = entity.parentId;
-    if (parentId === null) continue;
-    if (!leafPositionsByParent.has(parentId)) {
-      leafPositionsByParent.set(parentId, []);
-    }
-    leafPositionsByParent.get(parentId).push({ q: node.cellQ, r: node.cellR });
-  }
-
-  const anchorNodes = internalIds.map(id => {
-    const positions = leafPositionsByParent.get(id) || [];
-    let sumQ = 0, sumR = 0;
-    for (const pos of positions) {
-      sumQ += pos.q;
-      sumR += pos.r;
-    }
-    const centroidQ = positions.length > 0 ? sumQ / positions.length : 0;
-    const centroidR = positions.length > 0 ? sumR / positions.length : 0;
-    const qv = quantize(centroidQ, request.config.quantizationStep);
-    const rv = quantize(centroidR, request.config.quantizationStep);
-    const pos = axialToPlane(qv, rv);
-    const entity = entityById.get(id);
-    const isRoot = entity && entity.parentId === null;
-    return {
-      entityId: id,
-      kind: 'anchor',
-      x: pos.x,
-      y: pos.z,
-      vx: 0,
-      vy: 0,
-      fx: null,
-      fy: null,
-      isRoot,
-      cellQ: qv,
-      cellR: rv,
-    };
-  });
-
-  const allNodes = [...leafNodes, ...anchorNodes];
-  const nodeByEntityId = new Map(allNodes.map(n => [n.entityId, n]));
-
-  const links = [];
-  for (const entity of entities) {
-    if (entity.parentId === null) continue;
-    const source = nodeByEntityId.get(entity.id);
-    const target = nodeByEntityId.get(entity.parentId);
-    if (source && target) {
-      links.push({ source: source.entityId, target: target.entityId });
-    }
-  }
-
-  const leafLinkStrength = request.config.linkStrength * 4;
-  const simulation = forceSimulation(allNodes)
-    .force('link', forceLink(links)
-      .id(d => d.entityId)
-      .distance(request.config.linkDistance)
-      .strength(d => d.source.kind === 'leaf' ? leafLinkStrength : request.config.linkStrength)
-      .iterations(request.config.linkIterations))
-    .force('manyBody', forceManyBody()
-      .strength(d => d.kind === 'leaf' ? 0 : request.config.manyBodyStrength)
-      .theta(request.config.manyBodyTheta)
-      .distanceMin(request.config.manyBodyDistanceMin)
-      .distanceMax(request.config.manyBodyDistanceMax))
-    .force('center', forceCenter(0, 0).strength(request.config.centerStrength))
-    .velocityDecay(request.config.velocityDecay)
-    .alphaDecay(0)
-    .alphaMin(0)
-    .stop();
-
-  let totalProposals = 0;
-  let maxAnchorVelocity = 0;
-  let maxTargetError = 0;
-  let rmsTargetErrorSum = 0;
-  let targetCount = 0;
-
-  for (let tick = 0; tick < request.config.totalTicks; tick++) {
-    const schedule = request.config.alphaSchedule.find(s => tick >= s.fromTick && tick <= s.toTick);
-    if (schedule) {
-      const progress = (tick - schedule.fromTick) / (schedule.toTick - schedule.fromTick || 1);
-      simulation.alpha(schedule.from + (schedule.to - schedule.from) * progress);
-    }
-
-    simulation.tick();
-  }
-
-  simulation.alpha(0);
-  for (let tick = 0; tick < 32; tick++) {
-    simulation.tick();
-  }
-
-  for (const node of allNodes) {
-    if (node.kind === 'anchor' && !node.isRoot) {
-      const vel = Math.sqrt(node.vx * node.vx + node.vy * node.vy);
-      if (vel > maxAnchorVelocity) maxAnchorVelocity = vel;
-    }
-  }
-
-  const placements = initialLayout.placements;
-
-  const springs = [];
-  const springSources = entities
-    .filter(e => e.parentId !== null)
-    .sort((a, b) => {
-      if (a.order < b.order) return -1;
-      if (a.order > b.order) return 1;
-      if (a.id < b.id) return -1;
-      if (a.id > b.id) return 1;
-      return 0;
-    });
-
-  for (const entity of springSources) {
-    const sourceNode = nodeByEntityId.get(entity.id);
-    const targetNode = nodeByEntityId.get(entity.parentId);
-    if (!sourceNode || !targetNode) continue;
-
-    const isLeaf = leafSet.has(entity.id);
-    const sourceQ = isLeaf ? sourceNode.cellQ : quantize(sourceNode.x / (HEX_SIZE * Math.sqrt(3)) - sourceNode.y / (HEX_SIZE * 3), request.config.quantizationStep);
-    const sourceR = isLeaf ? sourceNode.cellR : quantize(sourceNode.y / (HEX_SIZE * 1.5), request.config.quantizationStep);
-    const targetQ = quantize(targetNode.x / (HEX_SIZE * Math.sqrt(3)) - targetNode.y / (HEX_SIZE * 3), request.config.quantizationStep);
-    const targetR = quantize(targetNode.y / (HEX_SIZE * 1.5), request.config.quantizationStep);
-
-    springs.push({
-      source: {
-        kind: isLeaf ? 'leaf' : 'anchor',
-        entityId: entity.id,
-        q: sourceQ,
-        r: sourceR,
-      },
-      target: {
-        kind: 'anchor',
-        entityId: entity.parentId,
-        q: targetQ,
-        r: targetR,
-      },
-    });
-  }
-
-  return {
-    requestId: request.requestId,
-    mode: request.mode,
-    placements,
-    springs,
-    gridRadius: initialLayout.gridRadius <= 256 ? initialLayout.gridRadius : 256,
-    stats: { occupiedCount: placements.length },
-    diagnostics: {
-      kind: 'force',
-      iterations: request.config.totalTicks,
-      assignmentEpochs: Math.ceil((request.config.mutableEndTick + 1) / request.config.assignmentInterval),
-      proposalCount: totalProposals,
-      converged: true,
-      maxTargetError,
-      rmsTargetError: rmsTargetErrorSum / Math.max(targetCount, 1),
-      maxAnchorVelocity,
-    },
-  };
-}
-
-// Version 2 is kept beside the original synchronous implementation while the
-// worker/runner protocol migrates to the retained session contract.
 export const FORCE_LAYOUT_CONFIG_V2 = deepFreeze({
   version: 2,
   seed: 0x5eed003,
@@ -369,6 +79,8 @@ export const FORCE_LAYOUT_CONFIG_V2 = deepFreeze({
 });
 
 export const FORCE_LAYOUT_VERSION_2_CONFIG = FORCE_LAYOUT_CONFIG_V2;
+// Kept as a thin export alias for existing importers; all calculations use V2.
+export const FORCE_LAYOUT_CONFIG = FORCE_LAYOUT_CONFIG_V2;
 
 const V2_TERMINAL_REASON = Object.freeze({ converged: 'CONVERGED', notConverged: 'NOT_CONVERGED' });
 
@@ -519,9 +231,8 @@ function createHexTargetForce(config, leafNodes) {
   const force = (alpha) => {
     for (const node of leafNodes) {
       if (node.controlFx !== null || node.automaticFx !== null) continue;
-      const target = axialToPlane(node.assignedQ, node.assignedR);
-      node.vx += (target.x - node.x) * strength * alpha;
-      node.vy += (target.z - node.y) * strength * alpha;
+      node.vx += (node.centerX - node.x) * strength * alpha;
+      node.vy += (node.centerY - node.y) * strength * alpha;
     }
   };
   force.initialize = (nextNodes) => { nodes = nextNodes; };
@@ -543,160 +254,188 @@ function assignmentHash(leafNodes) {
   return hash >>> 0;
 }
 
-function calculateQuantizedCost(node, cell, config) {
+function calculateQuantizedCost(node, q, r, config, center) {
   const predictedX = node.x + node.vx * config.predictionLookahead;
   const predictedY = node.y + node.vy * config.predictionLookahead;
-  const fractional = planeToAxial(predictedX, predictedY);
-  const predictedQ = quantize(fractional.q, config.decisionQuantizationStep);
-  const predictedR = quantize(fractional.r, config.decisionQuantizationStep);
-  const center = axialToPlane(cell.q, cell.r);
-  const dx = quantize((predictedX - center.x) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
-  const dy = quantize((predictedY - center.z) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
-  const distance = quantize(dx * dx + dy * dy, config.decisionQuantizationStep);
-  const move = cell.q === node.assignedQ && cell.r === node.assignedR ? 0 : config.movePenalty;
-  return {
-    value: quantize(distance + move, config.decisionQuantizationStep),
-    predictedQ,
-    predictedR,
-  };
+  axialToPlaneInto(q, r, center);
+  const dx = predictedX - center.x;
+  const dy = predictedY - center.z;
+  const distance = quantize(
+    (dx * dx + dy * dy) / (ADJACENT_CELL_SPACING * ADJACENT_CELL_SPACING),
+    config.decisionQuantizationStep,
+  );
+  const move = q === node.assignedQ && r === node.assignedR ? 0 : config.movePenalty;
+  return quantize(distance + move, config.decisionQuantizationStep);
 }
 
-function resolveAssignments(leafNodes, config, candidateOffsets) {
-  const candidatesByLeaf = new Array(leafNodes.length);
-  const costsByLeaf = new Array(leafNodes.length);
-  const previous = leafNodes.map((node) => ({ q: node.assignedQ, r: node.assignedR }));
-
+function resolveAssignments(leafNodes, config, candidateOffsets, storage) {
+  const { candidateQ, candidateR, costs, candidateCounts, nextCandidate, queue,
+    holderByCell, previousQ, previousR, nextQ, nextR, candidateCapacity,
+    fractional, center } = storage;
+  candidateCounts.fill(0);
+  nextCandidate.fill(0);
+  holderByCell.fill(-1);
   for (let leafIndex = 0; leafIndex < leafNodes.length; leafIndex += 1) {
     const node = leafNodes[leafIndex];
-    const predicted = planeToAxial(
+    previousQ[leafIndex] = node.assignedQ;
+    previousR[leafIndex] = node.assignedR;
+    const predicted = planeToAxialInto(
       node.x + node.vx * config.predictionLookahead,
       node.y + node.vy * config.predictionLookahead,
+      fractional,
     );
-    const origin = { q: Math.round(predicted.q), r: Math.round(predicted.r) };
-    const candidates = [];
-    const seen = new Set();
+    const predictedQ = quantize(predicted.q, config.decisionQuantizationStep);
+    const predictedR = quantize(predicted.r, config.decisionQuantizationStep);
+    // Search around the current assignment. Using the predicted world position
+    // as the lattice origin lets mobile anchors drag assignments indefinitely.
+    const originQ = node.assignedQ;
+    const originR = node.assignedR;
+    const start = leafIndex * candidateCapacity;
+    let count = 0;
     for (const offset of candidateOffsets) {
-      const cell = { q: origin.q + offset.q, r: origin.r + offset.r };
-      if (fractionalAxialRadius(cell.q, cell.r) > config.maxGridRadius) continue;
-      const key = `${cell.q},${cell.r}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      candidates.push(cell);
+      const q = originQ + offset.q;
+      const r = originR + offset.r;
+      if (fractionalAxialRadius(q, r) > config.maxGridRadius) continue;
+      const cost = calculateQuantizedCost(node, q, r, config, center);
+      let insert = count;
+      while (insert > 0) {
+        const previousIndex = start + insert - 1;
+        if (costs[previousIndex] < cost) break;
+        if (costs[previousIndex] === cost
+          && (candidateQ[previousIndex] < q
+            || (candidateQ[previousIndex] === q && candidateR[previousIndex] <= r))) break;
+        candidateQ[previousIndex + 1] = candidateQ[previousIndex];
+        candidateR[previousIndex + 1] = candidateR[previousIndex];
+        costs[previousIndex + 1] = costs[previousIndex];
+        insert -= 1;
+      }
+      candidateQ[start + insert] = q;
+      candidateR[start + insert] = r;
+      costs[start + insert] = cost;
+      count += 1;
     }
-    const oldCell = previous[leafIndex];
-    const oldKey = `${oldCell.q},${oldCell.r}`;
-    if (!seen.has(oldKey)) candidates.push(oldCell);
-    candidatesByLeaf[leafIndex] = candidates;
-    costsByLeaf[leafIndex] = candidates.map((cell) => calculateQuantizedCost(node, cell, config).value);
+    let hasPrevious = false;
+    for (let index = 0; index < count; index += 1) {
+      if (candidateQ[start + index] === node.assignedQ && candidateR[start + index] === node.assignedR) {
+        hasPrevious = true;
+        break;
+      }
+    }
+    if (!hasPrevious) {
+      const q = node.assignedQ;
+      const r = node.assignedR;
+      const cost = calculateQuantizedCost(node, q, r, config, center);
+      let insert = count;
+      while (insert > 0) {
+        const previousIndex = start + insert - 1;
+        if (costs[previousIndex] < cost) break;
+        if (costs[previousIndex] === cost
+          && (candidateQ[previousIndex] < q
+            || (candidateQ[previousIndex] === q && candidateR[previousIndex] <= r))) break;
+        candidateQ[previousIndex + 1] = candidateQ[previousIndex];
+        candidateR[previousIndex + 1] = candidateR[previousIndex];
+        costs[previousIndex + 1] = costs[previousIndex];
+        insert -= 1;
+      }
+      candidateQ[start + insert] = q;
+      candidateR[start + insert] = r;
+      costs[start + insert] = cost;
+      count += 1;
+    }
+    candidateCounts[leafIndex] = count;
+    queue[leafIndex] = leafIndex;
   }
 
-  const nextCandidate = new Int32Array(leafNodes.length);
-  const holderByCell = new Map();
-  const queue = Array.from({ length: leafNodes.length }, (_, index) => index);
-  let queueIndex = 0;
+  const cellWidth = config.maxGridRadius * 2 + 1;
+  let queueHead = 0;
+  let queueTail = leafNodes.length;
   let proposalCount = 0;
-  const prefers = (challenger, incumbent, cell) => {
-    const challengerCost = costsByLeaf[challenger][candidatesByLeaf[challenger].findIndex(
-      (candidate) => candidate.q === cell.q && candidate.r === cell.r,
-    )];
-    const incumbentCost = costsByLeaf[incumbent][candidatesByLeaf[incumbent].findIndex(
-      (candidate) => candidate.q === cell.q && candidate.r === cell.r,
-    )];
-    if (challengerCost !== incumbentCost) return challengerCost < incumbentCost;
-    const challengerOwns = previous[challenger].q === cell.q && previous[challenger].r === cell.r;
-    const incumbentOwns = previous[incumbent].q === cell.q && previous[incumbent].r === cell.r;
-    if (challengerOwns !== incumbentOwns) return challengerOwns;
-    return challenger < incumbent;
-  };
-
-  while (queueIndex < queue.length) {
-    const leafIndex = queue[queueIndex];
-    queueIndex += 1;
-    const candidates = candidatesByLeaf[leafIndex];
+  while (queueHead < queueTail) {
+    const leafIndex = queue[queueHead];
+    queueHead += 1;
     const candidateIndex = nextCandidate[leafIndex];
-    if (candidateIndex >= candidates.length) continue;
+    if (candidateIndex >= candidateCounts[leafIndex]) continue;
     nextCandidate[leafIndex] += 1;
     proposalCount += 1;
-    const cell = candidates[candidateIndex];
-    const key = `${cell.q},${cell.r}`;
-    const incumbent = holderByCell.get(key);
-    if (incumbent === undefined) {
-      holderByCell.set(key, leafIndex);
-    } else if (prefers(leafIndex, incumbent, cell)) {
-      holderByCell.set(key, leafIndex);
-      queue.push(incumbent);
+    const flatIndex = leafIndex * candidateCapacity + candidateIndex;
+    const q = candidateQ[flatIndex];
+    const r = candidateR[flatIndex];
+    const cellIndex = (q + config.maxGridRadius) * cellWidth + r + config.maxGridRadius;
+    const incumbent = holderByCell[cellIndex];
+    let challengerWins = incumbent === -1;
+    if (!challengerWins) {
+      let incumbentCost = Infinity;
+      const incumbentStart = incumbent * candidateCapacity;
+      for (let index = 0; index < candidateCounts[incumbent]; index += 1) {
+        if (candidateQ[incumbentStart + index] === q && candidateR[incumbentStart + index] === r) {
+          incumbentCost = costs[incumbentStart + index];
+          break;
+        }
+      }
+      const challengerCost = costs[flatIndex];
+      const challengerOwned = previousQ[leafIndex] === q && previousR[leafIndex] === r;
+      const incumbentOwned = previousQ[incumbent] === q && previousR[incumbent] === r;
+      challengerWins = challengerCost < incumbentCost
+        || (challengerCost === incumbentCost && challengerOwned !== incumbentOwned && challengerOwned)
+        || (challengerCost === incumbentCost && challengerOwned === incumbentOwned && leafIndex < incumbent);
+    }
+    if (challengerWins) {
+      holderByCell[cellIndex] = leafIndex;
+      nextQ[leafIndex] = q;
+      nextR[leafIndex] = r;
+      if (incumbent !== -1) queue[queueTail++] = incumbent;
     } else {
-      queue.push(leafIndex);
+      queue[queueTail++] = leafIndex;
     }
-  }
-
-  const nextByLeaf = new Array(leafNodes.length);
-  for (const [key, leafIndex] of holderByCell) {
-    const [q, r] = key.split(',').map(Number);
-    nextByLeaf[leafIndex] = { q, r };
-  }
-  let complete = holderByCell.size === leafNodes.length;
-  for (let leafIndex = 0; leafIndex < nextByLeaf.length; leafIndex += 1) {
-    if (nextByLeaf[leafIndex] === undefined) complete = false;
-  }
-  if (!complete) {
-    // Every previous cell is unique and is a protected fallback. A crowded
-    // radius-three frontier can exhaust its bounded queue; retain that
-    // complete assignment rather than publishing a partial ownership map.
-    for (let leafIndex = 0; leafIndex < leafNodes.length; leafIndex += 1) {
-      leafNodes[leafIndex].assignedQ = previous[leafIndex].q;
-      leafNodes[leafIndex].assignedR = previous[leafIndex].r;
-    }
-    return { changed: false, proposalCount, complete: true };
   }
 
   let changed = false;
   for (let leafIndex = 0; leafIndex < leafNodes.length; leafIndex += 1) {
     const node = leafNodes[leafIndex];
-    const next = nextByLeaf[leafIndex];
-    if (node.assignedQ !== next.q || node.assignedR !== next.r) changed = true;
-    node.assignedQ = next.q;
-    node.assignedR = next.r;
+    if (nextCandidate[leafIndex] === 0) return { changed: false, proposalCount, complete: false };
+    if (node.assignedQ !== nextQ[leafIndex] || node.assignedR !== nextR[leafIndex]) changed = true;
+    node.assignedQ = nextQ[leafIndex];
+    node.assignedR = nextR[leafIndex];
+    axialToPlaneInto(node.assignedQ, node.assignedR, center);
+    node.centerX = center.x;
+    node.centerY = center.z;
   }
   return { changed, proposalCount, complete: true };
 }
 
-function metricError(leafNodes, config) {
+function metricError(leafNodes, config, output) {
   let max = 0;
   let sumSquares = 0;
   for (const node of leafNodes) {
-    const target = axialToPlane(node.assignedQ, node.assignedR);
-    const dx = quantize((node.x - target.x) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
-    const dy = quantize((node.y - target.z) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
+    const dx = quantize((node.x - node.centerX) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
+    const dy = quantize((node.y - node.centerY) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
     const value = Math.hypot(dx, dy);
     max = Math.max(max, value);
     sumSquares += value * value;
   }
-  return {
-    max: quantize(max, config.decisionQuantizationStep),
-    rms: quantize(Math.sqrt(sumSquares / Math.max(leafNodes.length, 1)), config.decisionQuantizationStep),
-  };
+  output.max = quantize(max, config.decisionQuantizationStep);
+  output.rms = quantize(Math.sqrt(sumSquares / Math.max(leafNodes.length, 1)), config.decisionQuantizationStep);
+  return output;
 }
 
-function movementMetric(nodes, leafNodes, previousPositions, config) {
-  if (!previousPositions) return { max: 0, rms: 0 };
-  let previousLeafX = 0;
-  let previousLeafY = 0;
-  let currentLeafX = 0;
-  let currentLeafY = 0;
-  for (const node of leafNodes) {
+function movementMetric(nodes, leafNodes, previousPositions, config, output) {
+  let previousNodeX = 0;
+  let previousNodeY = 0;
+  let currentNodeX = 0;
+  let currentNodeY = 0;
+  for (const node of nodes) {
     const index = node.index * 2;
-    previousLeafX += previousPositions[index];
-    previousLeafY += previousPositions[index + 1];
-    currentLeafX += node.x;
-    currentLeafY += node.y;
+    previousNodeX += previousPositions[index];
+    previousNodeY += previousPositions[index + 1];
+    currentNodeX += node.x;
+    currentNodeY += node.y;
   }
-  const leafCount = Math.max(leafNodes.length, 1);
-  const translationX = (currentLeafX - previousLeafX) / leafCount;
-  const translationY = (currentLeafY - previousLeafY) / leafCount;
+  const nodeCount = Math.max(nodes.length, 1);
+  const translationX = (currentNodeX - previousNodeX) / nodeCount;
+  const translationY = (currentNodeY - previousNodeY) / nodeCount;
   let max = 0;
   let sumSquares = 0;
-  for (const node of nodes) {
+  for (const node of leafNodes) {
     const index = node.index * 2;
     const dx = quantize((node.x - previousPositions[index] - translationX) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
     const dy = quantize((node.y - previousPositions[index + 1] - translationY) / ADJACENT_CELL_SPACING, config.decisionQuantizationStep);
@@ -704,10 +443,9 @@ function movementMetric(nodes, leafNodes, previousPositions, config) {
     max = Math.max(max, value);
     sumSquares += value * value;
   }
-  return {
-    max: quantize(max, config.decisionQuantizationStep),
-    rms: quantize(Math.sqrt(sumSquares / Math.max(nodes.length, 1)), config.decisionQuantizationStep),
-  };
+  output.max = quantize(max, config.decisionQuantizationStep);
+  output.rms = quantize(Math.sqrt(sumSquares / Math.max(leafNodes.length, 1)), config.decisionQuantizationStep);
+  return output;
 }
 
 function createV2Result(session) {
@@ -799,9 +537,6 @@ function makeFrame(session, terminal = 'none', result = null) {
 
 export function createForceLayoutSession(request) {
   try {
-    if (request?.config?.version === 1 && request.config.totalTicks !== undefined) {
-      request = { ...request, config: structuredClone(FORCE_LAYOUT_CONFIG_V2) };
-    }
     if (request?.mode !== 'force-anchors') {
       throw new ForceLayoutError('UNKNOWN_MODE', { mode: request?.mode });
     }
@@ -837,6 +572,8 @@ export function createForceLayoutSession(request) {
           vy: 0,
           assignedQ: cell.q,
           assignedR: cell.r,
+          centerX: position.x,
+          centerY: position.z,
           automaticFx: null,
           automaticFy: null,
           controlFx: null,
@@ -899,7 +636,7 @@ export function createForceLayoutSession(request) {
         .strength(request.config.linkStrength)
         .iterations(request.config.linkIterations))
       .force('manyBody', forceManyBody()
-        .strength(request.config.manyBodyStrength)
+        .strength((node) => node.kind === 'leaf' ? 0 : request.config.manyBodyStrength)
         .theta(request.config.manyBodyTheta)
         .distanceMin(request.config.manyBodyDistanceMin)
         .distanceMax(request.config.manyBodyDistanceMax))
@@ -910,6 +647,30 @@ export function createForceLayoutSession(request) {
       .alphaMin(0)
       .stop();
 
+    const candidateOffsets = buildCandidateOffsets(request.config.candidateRadius);
+    const candidateCapacity = candidateOffsets.length + 1;
+    const leafCount = leafNodes.length;
+    const assignmentStorage = {
+      candidateCapacity,
+      candidateQ: new Int32Array(leafCount * candidateCapacity),
+      candidateR: new Int32Array(leafCount * candidateCapacity),
+      costs: new Float64Array(leafCount * candidateCapacity),
+      candidateCounts: new Uint8Array(leafCount),
+      nextCandidate: new Uint8Array(leafCount),
+      queue: new Int32Array(leafCount * candidateCapacity),
+      holderByCell: new Int32Array((request.config.maxGridRadius * 2 + 1) ** 2),
+      previousQ: new Int32Array(leafCount),
+      previousR: new Int32Array(leafCount),
+      nextQ: new Int32Array(leafCount),
+      nextR: new Int32Array(leafCount),
+      fractional: { q: 0, r: 0 },
+      center: { x: 0, z: 0 },
+    };
+    const previousPositions = new Float64Array(nodes.length * 2);
+    for (const node of nodes) {
+      previousPositions[node.index * 2] = node.x;
+      previousPositions[node.index * 2 + 1] = node.y;
+    }
     const session = {
       requestId: request.requestId,
       request,
@@ -921,7 +682,8 @@ export function createForceLayoutSession(request) {
       anchorNodes,
       simulation,
       targetForce,
-      candidateOffsets: buildCandidateOffsets(request.config.candidateRadius),
+      candidateOffsets,
+      assignmentStorage,
       state: {
         phase: 'running',
         globalStep: 0,
@@ -940,8 +702,9 @@ export function createForceLayoutSession(request) {
         movement: { max: 0, rms: 0 },
         terminationReason: null,
       },
-      previousPositions: null,
+      previousPositions,
       automaticLock: false,
+      assignmentFrozen: false,
       commandQueue: [],
       fixedLeaves: new Map(),
       transcript: [],
@@ -986,14 +749,22 @@ export function createForceLayoutSession(request) {
       if (!leaf) return semanticReject('NON_LEAF_ENTITY', { entityId: command.entityId });
       if (command.action === 'set-fixed-position') {
         if (!Number.isFinite(command.x) || !Number.isFinite(command.y)) return semanticReject('NON_FINITE_POSITION');
-        const fractional = planeToAxial(command.x, command.y);
-        if (fractionalAxialRadius(fractional.q, fractional.r) > session.config.maxGridRadius) {
+        const x = quantize(command.x, session.config.decisionQuantizationStep);
+        const y = quantize(command.y, session.config.decisionQuantizationStep);
+        const fractional = planeToAxial(x, y);
+        const q = quantize(fractional.q, session.config.decisionQuantizationStep);
+        const r = quantize(fractional.r, session.config.decisionQuantizationStep);
+        if (fractionalAxialRadius(q, r) > session.config.maxGridRadius) {
           return semanticReject('POSITION_OUTSIDE_GRID', { maxGridRadius: session.config.maxGridRadius });
         }
+        session.commandQueue.push({ ...command, x, y });
       } else if (command.action !== 'release-fixed-position') {
         return semanticReject('UNKNOWN_ACTION', { action: command.action });
+      } else if (!session.fixedLeaves.has(command.entityId)) {
+        return semanticReject('NOT_FIXED', { entityId: command.entityId });
+      } else {
+        session.commandQueue.push({ ...command });
       }
-      session.commandQueue.push({ ...command });
       return null;
     };
 
@@ -1007,9 +778,8 @@ export function createForceLayoutSession(request) {
           continue;
         }
         if (command.action === 'set-fixed-position') {
-          const point = planeToAxial(command.x, command.y);
-          const x = quantize(command.x, session.config.decisionQuantizationStep);
-          const y = quantize(command.y, session.config.decisionQuantizationStep);
+          const x = command.x;
+          const y = command.y;
           if (session.fixedLeaves.size === 0) {
             session.state.epoch += 1;
             session.state.epochStep = 0;
@@ -1020,6 +790,7 @@ export function createForceLayoutSession(request) {
             session.state.stableStreak = 0;
             session.state.unchangedAssignmentEpochs = 0;
             session.automaticLock = false;
+            session.assignmentFrozen = false;
             session.targetForce.setStrength(session.config.hexStrength.mutable);
             for (const controlled of leafNodes) {
             controlled.automaticFx = null;
@@ -1043,7 +814,6 @@ export function createForceLayoutSession(request) {
           receipts.push({ accepted: true, requestId: session.requestId, commandSeq: command.commandSeq, epoch: session.state.epoch, appliedAfterGlobalStep: session.state.globalStep, fixedCount: session.fixedLeaves.size });
         } else {
           if (!session.fixedLeaves.has(leaf.entityId)) {
-            session.state.acceptedCommandSeq = command.commandSeq;
             receipts.push({ accepted: false, requestId: session.requestId, commandSeq: command.commandSeq, epoch: session.state.epoch, appliedAfterGlobalStep: null, fixedCount: session.fixedLeaves.size, error: { code: 'NOT_FIXED', details: { entityId: leaf.entityId } } });
             continue;
           }
@@ -1060,8 +830,10 @@ export function createForceLayoutSession(request) {
             session.state.epochStep = 0;
             session.state.stableStreak = 0;
             session.state.unchangedAssignmentEpochs = 0;
-            session.state.targetError = { max: 0, rms: 0 };
-            session.state.movement = { max: 0, rms: 0 };
+            session.state.targetError.max = 0;
+            session.state.targetError.rms = 0;
+            session.state.movement.max = 0;
+            session.state.movement.rms = 0;
             session.state.alpha = session.config.alphaSchedule.initial;
           }
           receipts.push({ accepted: true, requestId: session.requestId, commandSeq: command.commandSeq, epoch: session.state.epoch, appliedAfterGlobalStep: session.state.globalStep, fixedCount: session.fixedLeaves.size });
@@ -1085,8 +857,13 @@ export function createForceLayoutSession(request) {
       const alpha = Math.max(alphaSchedule.minimum, alphaSchedule.initial * Math.pow(1 - alphaSchedule.decay, session.state.coolingStep));
       session.state.alpha = isHeld ? Math.max(alphaSchedule.minimum, alpha) : alpha;
       session.simulation.alpha(session.state.alpha);
-      if (!session.automaticLock && !isHeld && session.state.coolingStep % session.config.assignmentInterval === 0 && session.state.unchangedAssignmentEpochs < session.config.stableAssignmentEpochs) {
-        const assignment = resolveAssignments(session.leafNodes, session.config, session.candidateOffsets);
+      if (!session.assignmentFrozen && !isHeld && session.state.coolingStep % session.config.assignmentInterval === 0) {
+        const assignment = resolveAssignments(
+          session.leafNodes,
+          session.config,
+          session.candidateOffsets,
+          session.assignmentStorage,
+        );
         session.state.assignmentEpochs += 1;
         session.state.proposalCount += assignment.proposalCount;
         if (!assignment.complete) throw new ForceLayoutError('ASSIGNMENT_INVARIANT', { phase: 'proposal-resolution' });
@@ -1095,56 +872,48 @@ export function createForceLayoutSession(request) {
           session.state.unchangedAssignmentEpochs = 0;
         } else {
           session.state.unchangedAssignmentEpochs += 1;
+          if (session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs) {
+            session.assignmentFrozen = true;
+            session.targetForce.setStrength(session.config.hexStrength.stable);
+          }
         }
       }
-      const assignmentBounded = session.state.assignmentEpochs >= 6
-        && session.state.coolingStep >= session.config.minSteps - session.config.consecutiveStableSteps
-        && session.config.centerLockThresholds.maxCellSpacing > 0
-        && session.config.centerLockThresholds.rmsCellSpacing > 0;
-      if ((session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs || assignmentBounded) && !isHeld) {
-        session.targetForce.setStrength(session.config.hexStrength.stable);
-        const error = metricError(session.leafNodes, session.config);
-        // The bounded fallback keeps the numbered session live for sparse
-        // graphs where many-body repulsion leaves a tiny but persistent error.
-        // The regular path still requires both configured center gates.
+      if (session.assignmentFrozen && !isHeld) {
+        const error = metricError(session.leafNodes, session.config, session.state.targetError);
         const lockEligible = error.max <= session.config.centerLockThresholds.maxCellSpacing
           && error.rms <= session.config.centerLockThresholds.rmsCellSpacing;
-        const boundedStable = session.state.coolingStep >= session.config.minSteps - session.config.consecutiveStableSteps;
-        if (!session.automaticLock && (lockEligible || boundedStable)) {
+        if (!session.automaticLock && session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs) {
           session.automaticLock = true;
           session.state.phase = 'center-locking';
           for (const leaf of session.leafNodes) {
-            const center = axialToPlane(leaf.assignedQ, leaf.assignedR);
-            leaf.automaticFx = center.x;
-            leaf.automaticFy = center.z;
-            leaf.fx = center.x;
-            leaf.fy = center.z;
-          }
-          for (const anchor of session.anchorNodes) {
-            anchor.fx = anchor.x;
-            anchor.fy = anchor.y;
+            leaf.automaticFx = leaf.centerX;
+            leaf.automaticFy = leaf.centerY;
+            leaf.fx = leaf.centerX;
+            leaf.fy = leaf.centerY;
           }
         }
       }
       session.simulation.tick();
       const previous = session.previousPositions;
-      session.state.targetError = session.fixedLeaves.size === 0
-        ? metricError(session.leafNodes, session.config)
-        : { max: Number.MAX_SAFE_INTEGER, rms: Number.MAX_SAFE_INTEGER };
-      session.state.movement = movementMetric(session.nodes, session.leafNodes, previous, session.config);
-      session.previousPositions = new Float64Array(session.nodes.length * 2);
+      if (session.fixedLeaves.size === 0) {
+        metricError(session.leafNodes, session.config, session.state.targetError);
+      } else {
+        session.state.targetError.max = Number.MAX_SAFE_INTEGER;
+        session.state.targetError.rms = Number.MAX_SAFE_INTEGER;
+      }
+      movementMetric(session.nodes, session.leafNodes, previous, session.config, session.state.movement);
       for (const node of session.nodes) {
         session.previousPositions[node.index * 2] = node.x;
         session.previousPositions[node.index * 2 + 1] = node.y;
       }
       // The metric compares the completed tick, so the first stored snapshot
       // is replaced only after the current comparison has been evaluated.
-      const terminalQuality = session.state.globalStep >= session.config.minSteps
+      const terminalQuality = session.state.coolingStep >= session.config.minSteps
         && session.fixedLeaves.size === 0
+        && session.assignmentFrozen
         && session.automaticLock
         && session.leafNodes.every((leaf) => {
-          const center = axialToPlane(leaf.assignedQ, leaf.assignedR);
-          return leaf.x === center.x && leaf.y === center.z;
+          return leaf.x === leaf.centerX && leaf.y === leaf.centerY;
         })
         && session.state.movement.max <= session.config.movementThresholds.maxCellSpacing
         && session.state.movement.rms <= session.config.movementThresholds.rmsCellSpacing;
@@ -1200,7 +969,7 @@ export function createForceLayoutSession(request) {
   }
 }
 
-function calculateForceLayoutV2(request) {
+export function calculateForceLayout(request) {
   const session = createForceLayoutSession(request);
   try {
     let frame = session.initialFrame();

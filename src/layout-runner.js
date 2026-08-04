@@ -81,13 +81,19 @@ export function createLayoutRunner({
         if (state.destroyed) return;
         state.destroyed = true;
         if (state.timer) clearTimer(state.timer);
+        for (const waiter of state.controlWaiters.values()) {
+          if (waiter.timer) clearTimer(waiter.timer);
+        }
         worker.removeEventListener('message', onMessage);
         worker.removeEventListener('error', onError);
         worker.removeEventListener('messageerror', onMessageError);
         if (terminate) worker.terminate();
         if (activeState === state) activeState = null;
         if (error && state.phase !== 'settled-awaiting-commit' && state.phase !== 'retained-settled') reject(error);
-        for (const waiter of state.controlWaiters.values()) waiter.reject(error || createRunnerError('CANCELLED', state.requestId, {}));
+        for (const waiter of state.controlWaiters.values()) {
+          if (waiter.timer) clearTimer(waiter.timer);
+          waiter.reject(error || createRunnerError('CANCELLED', state.requestId, {}));
+        }
         for (const waiter of state.epochWaiters.values()) waiter.reject(error || createRunnerError('CANCELLED', state.requestId, {}));
         state.controlWaiters.clear();
         state.epochWaiters.clear();
@@ -104,6 +110,57 @@ export function createLayoutRunner({
       };
       state.armGuard();
 
+      state.armCommandGuard = (waiter) => {
+        waiter.guardRemaining = hangGuardMs;
+        waiter.guardStartedAt = performance.now();
+        waiter.guardPausedAt = null;
+        waiter.timer = setTimer(() => {
+          state.controlWaiters.delete(waiter.commandSeq);
+          const error = createRunnerError('CONTROL_TIMEOUT', state.requestId, { commandSeq: waiter.commandSeq });
+          waiter.reject(error);
+          state.destroy(error);
+        }, waiter.guardRemaining);
+      };
+
+      state.clearCommandGuard = (waiter) => {
+        if (waiter.timer) {
+          clearTimer(waiter.timer);
+          waiter.timer = null;
+        }
+      };
+
+      state.pauseCommandGuards = () => {
+        const now = performance.now();
+        for (const waiter of state.controlWaiters.values()) {
+          if (waiter.timer) {
+            const elapsed = Math.max(0, now - waiter.guardStartedAt);
+            waiter.guardRemaining = Math.max(0, waiter.guardRemaining - elapsed);
+            waiter.guardPausedAt = now;
+            clearTimer(waiter.timer);
+            waiter.timer = null;
+          }
+        }
+      };
+
+      state.resumeCommandGuards = () => {
+        const now = performance.now();
+        for (const waiter of state.controlWaiters.values()) {
+          if (waiter.guardPausedAt !== null && waiter.guardRemaining > 0 && !waiter.timer) {
+            const pausedDuration = now - waiter.guardPausedAt;
+            waiter.guardRemaining = Math.max(0, waiter.guardRemaining - pausedDuration);
+            waiter.guardPausedAt = null;
+            if (waiter.guardRemaining > 0) {
+              waiter.timer = setTimer(() => {
+                state.controlWaiters.delete(waiter.commandSeq);
+                const error = createRunnerError('CONTROL_TIMEOUT', state.requestId, { commandSeq: waiter.commandSeq });
+                waiter.reject(error);
+                state.destroy(error);
+              }, waiter.guardRemaining);
+            }
+          }
+        }
+      };
+
       const fail = (code, details = {}) => {
         const error = createRunnerError(code, state.requestId, details);
         destroy(error);
@@ -111,14 +168,17 @@ export function createLayoutRunner({
 
       const acknowledge = async (frame, mode = 'painted') => {
         if (state.destroyed || !state.outstanding || state.outstanding.globalStep !== frame.globalStep) return;
+        const outstanding = state.outstanding;
         const callback = frame.epoch > 0 && state.outstanding.isEpochReady
           ? state.options.onEpochReady
           : state.outstanding.type === 'ready' ? state.options.onReady : state.options.onStep;
         let receipt = null;
         try {
           receipt = callback
-            ? await (state.outstanding.type === 'ready' || state.outstanding.isEpochReady
-              ? callback(state.topology, frame)
+            ? await (outstanding.type === 'ready' || outstanding.isEpochReady
+              ? callback(outstanding.isEpochReady
+                ? { requestId: state.requestId, epoch: frame.epoch, globalStep: frame.globalStep, topology: structuredClone(state.topology) }
+                : state.topology, frame)
               : callback(frame))
             : null;
         } catch (error) {
@@ -126,7 +186,8 @@ export function createLayoutRunner({
           fail('PRESENTATION_FAILED', { message: error?.message || 'observer failed' });
           return;
         }
-        const expectedBuffer = state.outstanding.buffer;
+        if (state.destroyed || state.outstanding !== outstanding) return;
+        const expectedBuffer = outstanding.buffer;
         const actual = receipt || { requestId: state.requestId, globalStep: frame.globalStep, buffer: expectedBuffer };
         if (
           actual.requestId !== state.requestId
@@ -144,13 +205,14 @@ export function createLayoutRunner({
         }
       };
 
-      const onMessage = (event) => {
+      const onMessage = async (event) => {
         const response = event.data;
         if (!response || typeof response !== 'object' || response.requestId !== state.requestId) {
           fail('PROTOCOL_ERROR', { reason: 'request-identity' });
           return;
         }
         if (response.type === 'ready' || response.type === 'step') {
+          const previousEpoch = state.lastEpoch ?? -1;
           try {
             if (response.type === 'ready') {
               validateTopology(response.topology, state.requestId);
@@ -160,6 +222,7 @@ export function createLayoutRunner({
             const expectedStep = response.type === 'ready' ? 0 : (state.lastGlobalStep ?? -1) + 1;
             if (response.globalStep !== expectedStep) throw new Error('non-contiguous global step');
             state.lastGlobalStep = response.globalStep;
+            state.lastEpoch = response.epoch;
           } catch {
             fail('PROTOCOL_ERROR', { reason: 'invalid-frame' });
             return;
@@ -173,10 +236,10 @@ export function createLayoutRunner({
             buffer: response.positions.buffer,
             frame: response,
             type: response.type,
-            isEpochReady: response.epoch > 0 && response.epochStep === 0,
+            isEpochReady: response.epoch > 0 && response.epoch !== previousEpoch,
           };
           state.phase = 'waiting-for-paint';
-          void acknowledge(response);
+          await acknowledge(response);
           return;
         }
         if (response.type === 'force-control-result') {
@@ -186,10 +249,13 @@ export function createLayoutRunner({
             return;
           }
           state.controlWaiters.delete(response.commandSeq);
+          state.clearCommandGuard(waiter);
           if (response.accepted) {
             state.phase = response.fixedCount > 0 ? 'held' : 'interaction-cooling';
             state.guardRemaining = hangGuardMs;
-            if (!state.timer) state.armGuard();
+            if (state.timer) clearTimer(state.timer);
+            state.timer = null;
+            if (response.fixedCount === 0) state.armGuard();
           }
           waiter.resolve(structuredClone(response));
           return;
@@ -209,6 +275,7 @@ export function createLayoutRunner({
           }
           state.terminalFrame = response.terminalFrame;
           state.terminalBuffer = response.terminalFrame?.positions?.buffer || null;
+          state.terminalEpoch = response.epoch ?? 0;
           state.phase = response.type === 'success' ? 'settled-awaiting-commit' : 'epoch-awaiting-commit';
           const settlement = Object.freeze({
             requestId: state.requestId,
@@ -226,7 +293,11 @@ export function createLayoutRunner({
             return;
           }
           if (response.type === 'success') resolve(response.result);
-          else state.epochWaiters.get(response.epoch)?.resolve(settlement);
+          else {
+            const waiter = state.epochWaiters.get(response.epoch);
+            state.epochWaiters.delete(response.epoch);
+            waiter?.resolve(settlement);
+          }
           return;
         }
         if (response.type === 'failure') {
@@ -256,6 +327,9 @@ export function createLayoutRunner({
 
   function runLayout(request) {
     if (request.config?.version === 2) {
+      if (!environmentCheck()) {
+        return Promise.reject(createRunnerError('UNSUPPORTED_ENVIRONMENT', request.requestId, { capability: 'module-worker' }));
+      }
       return runRetainedLayout(request, arguments[1] || {});
     }
     if (request.mode !== 'force-anchors') {
@@ -383,6 +457,9 @@ export function createLayoutRunner({
     if (!(state.terminalBuffer instanceof ArrayBuffer)) {
       throw createRunnerError('INVALID_COMMIT', requestId, { reason: 'missing-terminal-buffer' });
     }
+    if (epoch !== state.terminalEpoch) {
+      throw createRunnerError('INVALID_COMMIT', requestId, { expectedEpoch: state.terminalEpoch, epoch });
+    }
     const terminalBuffer = state.terminalBuffer;
     try {
       state.worker.postMessage({ type: 'session-result-committed', requestId, epoch, terminalBuffer }, [terminalBuffer]);
@@ -411,7 +488,9 @@ export function createLayoutRunner({
     const commandSeq = state.nextCommandSeq;
     state.nextCommandSeq += 1;
     return new Promise((resolve, reject) => {
-      state.controlWaiters.set(commandSeq, { resolve, reject });
+      const waiter = { resolve, reject, commandSeq, timer: null, guardRemaining: hangGuardMs, guardStartedAt: null, guardPausedAt: null };
+      state.controlWaiters.set(commandSeq, waiter);
+      state.armCommandGuard(waiter);
       try {
         const { requestId, action, entityId, x, y } = input;
         state.worker.postMessage({
@@ -422,6 +501,7 @@ export function createLayoutRunner({
         });
       } catch {
         state.controlWaiters.delete(commandSeq);
+        state.clearCommandGuard(waiter);
         reject(createRunnerError('WORKER_MESSAGE_FAILED', state.requestId, {}));
       }
     });
@@ -430,6 +510,9 @@ export function createLayoutRunner({
   function waitForEpochSettlement(requestId, epoch) {
     const state = activeState;
     if (!state || state.kind !== 'v2' || state.requestId !== requestId) return Promise.reject(createRunnerError('SESSION_UNAVAILABLE', requestId, {}));
+    if (!Number.isSafeInteger(epoch) || epoch <= 0 || state.epochWaiters.has(epoch) || epoch <= (state.terminalEpoch ?? 0)) {
+      return Promise.reject(createRunnerError('INVALID_EPOCH', requestId, { epoch }));
+    }
     return new Promise((resolve, reject) => {
       state.epochWaiters.set(epoch, { resolve, reject });
     });
@@ -448,8 +531,10 @@ export function createLayoutRunner({
         clearTimer(state.timer);
         state.timer = null;
       }
+      state.pauseCommandGuards();
     } else if (!state.timer && state.phase !== 'settled-awaiting-commit' && state.phase !== 'retained-settled') {
       state.armGuard();
+      state.resumeCommandGuards();
     }
   }
 

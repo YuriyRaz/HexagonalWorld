@@ -190,7 +190,6 @@ h1 em { color: var(--lime); font-style: normal; }
 
 .generator-form[aria-busy="true"] {
   opacity: 0.6;
-  pointer-events: none;
 }
 
 .generator-form__heading {
