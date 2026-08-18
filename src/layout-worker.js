@@ -12,7 +12,13 @@ function post(postMessage, message, transfer = []) {
   postMessage(message, transfer);
 }
 
-function createWorkerController(postMessage, calculate = calculateLayout, calculateForce = calculateForceLayout) {
+function createWorkerController(
+  postMessage,
+  calculate = calculateLayout,
+  calculateForce = calculateForceLayout,
+  schedule = (callback) => setTimeout(callback, 0),
+  cancelSchedule = clearTimeout,
+) {
   let active = null;
 
   function sendFailure(requestId, error, extra = {}) {
@@ -24,9 +30,11 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
     const terminalFrame = {
       ...frame,
       positions: new Float32Array(frame.positions),
+      leafCells: new Int16Array(frame.leafCells),
       result: frame.result,
     };
-    state.terminalByteLength = terminalFrame.positions.byteLength;
+    state.terminalPositionByteLength = terminalFrame.positions.byteLength;
+    state.terminalCellByteLength = terminalFrame.leafCells.byteLength;
     if (frame.terminal === 'converged') {
       state.phase = 'settled-awaiting-commit';
       post(postMessage, {
@@ -37,7 +45,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
         topology: state.topology,
         result: frame.result,
         terminalFrame,
-      }, [terminalFrame.positions.buffer]);
+      }, [terminalFrame.positions.buffer, terminalFrame.leafCells.buffer]);
     } else {
       state.phase = 'failed';
       post(postMessage, {
@@ -49,7 +57,9 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
           code: 'NOT_CONVERGED',
           details: { coolingStep: frame.coolingStep, globalStep: frame.globalStep },
         },
-      }, [terminalFrame.positions.buffer]);
+      }, [terminalFrame.positions.buffer, terminalFrame.leafCells.buffer]);
+      state.session.dispose();
+      if (active === state) active = null;
     }
   }
 
@@ -76,15 +86,20 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
 
   function sendFrame(state, frame, type = 'step') {
     state.outstanding = { frame };
+    const transfers = [frame.positions.buffer];
+    if (frame.leafCells && frame.leafCells.buffer) {
+      transfers.push(frame.leafCells.buffer);
+    }
     post(postMessage, {
       type,
       requestId: state.requestId,
       topology: type === 'ready' ? state.topology : undefined,
       ...frame,
-    }, [frame.positions.buffer]);
+    }, transfers);
   }
 
   function advance(state) {
+    if (active !== state || state.scheduled !== null) return;
     try {
       const frame = state.session.advanceOneStep();
       sendFrame(state, frame, 'step');
@@ -93,6 +108,32 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       sendFailure(state.requestId, error, { globalStep: state.session.state?.globalStep });
       active = null;
     }
+  }
+
+  function scheduleFinalOnly(state) {
+    if (active !== state || state.scheduled !== null) return;
+    state.scheduled = schedule(() => {
+      state.scheduled = null;
+      if (active !== state) return;
+      try {
+        const frame = state.session.advanceOneStep();
+        if (frame.terminal === 'none') scheduleFinalOnly(state);
+        else sendTerminal(state, frame);
+      } catch (error) {
+        state.session.dispose();
+        sendFailure(state.requestId, error, { globalStep: state.session.state?.globalStep });
+        if (active === state) active = null;
+      }
+    });
+  }
+
+  function disposeState(state) {
+    if (state.scheduled !== null) {
+      cancelSchedule(state.scheduled);
+      state.scheduled = null;
+    }
+    state.session.dispose();
+    if (active === state) active = null;
   }
 
   function startV2(request, presentation = 'all-steps') {
@@ -111,31 +152,16 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
       phase: 'running',
       presentation,
       outstanding: null,
-      terminalByteLength: 0,
+      scheduled: null,
+      terminalPositionByteLength: 0,
+      terminalCellByteLength: 0,
       lastReceiptGlobalStep: -1,
       lastSuppressedStep: -1,
     };
     active = state;
 
-    if (presentation === 'final-only') {
-      try {
-        sendFrame(state, session.initialFrame(), 'ready');
-        state.outstanding = null;
-        let frame = state.outstanding?.frame;
-        while (!frame || frame.terminal === 'none') {
-          frame = session.advanceOneStep();
-        }
-        if (frame.terminal === 'none') return;
-        sendTerminal(state, frame);
-      } catch (error) {
-        session.dispose();
-        sendFailure(request.requestId, error);
-        active = null;
-      }
-      return;
-    }
-
-    sendFrame(state, session.initialFrame(), 'ready');
+    if (presentation === 'final-only') scheduleFinalOnly(state);
+    else sendFrame(state, session.initialFrame(), 'ready');
   }
 
   function startLegacy(request, calculateFn) {
@@ -155,8 +181,7 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
     if (!message || typeof message !== 'object') return;
     if (message.type === 'calculate' && message.request) {
       if (active) {
-        active.session?.dispose();
-        active = null;
+        disposeState(active);
       }
       if (message.request.config?.version === 2 && message.request.config.maxCoolingSteps !== undefined) {
         startV2(message.request, message.presentation || message.request.presentation || 'all-steps');
@@ -175,36 +200,42 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
     if (message.type === 'painted' || message.type === 'suppress') {
       if (!state.outstanding || message.globalStep !== state.outstanding.frame.globalStep) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'unexpected-paint-receipt' } });
-        state.session.dispose();
-        active = null;
+        disposeState(state);
         return;
       }
       if (state.outstanding.frame.epoch !== state.epoch) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'epoch-mismatch' } });
-        state.session.dispose();
-        active = null;
+        disposeState(state);
         return;
       }
       if (message.globalStep < state.lastReceiptGlobalStep) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'stale-receipt' } });
-        state.session.dispose();
-        active = null;
+        disposeState(state);
         return;
       }
       if (message.type === 'painted' && message.globalStep === state.lastSuppressedStep) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'suppression-race' } });
-        state.session.dispose();
-        active = null;
+        disposeState(state);
         return;
       }
-      const expectedByteLength = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
-      if (!(message.buffer instanceof ArrayBuffer) || message.buffer.byteLength !== expectedByteLength) {
-        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'invalid-paint-buffer' } });
-        state.session.dispose();
-        active = null;
+      const expectedPositionBytes = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      const leafCount = state.topology.nodeKinds.filter((kind) => kind === 'leaf').length;
+      const expectedCellBytes = leafCount * 2 * Int16Array.BYTES_PER_ELEMENT;
+      if (!(message.positionBuffer instanceof ArrayBuffer) || message.positionBuffer.byteLength !== expectedPositionBytes
+        || !(message.cellBuffer instanceof ArrayBuffer) || message.cellBuffer.byteLength !== expectedCellBytes) {
+        sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'invalid-presentation-buffers' } });
+        disposeState(state);
         return;
       }
-      state.outstanding.frame.positions = new Float32Array(message.buffer);
+      try {
+        state.session.reclaimFrameBuffers(message.positionBuffer, message.cellBuffer);
+      } catch (error) {
+        sendFailure(state.requestId, error);
+        disposeState(state);
+        return;
+      }
+      state.outstanding.frame.positions = state.session.frameBuffers.positions;
+      state.outstanding.frame.leafCells = state.session.frameBuffers.leafCells;
       state.lastReceiptGlobalStep = message.globalStep;
       if (message.type === 'suppress') {
         state.lastSuppressedStep = message.globalStep;
@@ -237,34 +268,40 @@ function createWorkerController(postMessage, calculate = calculateLayout, calcul
           return;
         }
         state.phase = state.session.fixedLeaves.size > 0 ? 'held' : 'cooling';
-        if (!state.outstanding) advance(state);
+        if (!state.outstanding) {
+          if (state.presentation === 'final-only') scheduleFinalOnly(state);
+          else advance(state);
+        }
       } catch (error) {
         sendFailure(state.requestId, error);
-        state.session.dispose();
-        active = null;
+        disposeState(state);
       }
       return;
     }
     if (message.type === 'session-result-committed') {
-      const expectedByteLength = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      const expectedPositionBytes = state.topology.nodeIds.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      const leafCount = state.topology.nodeKinds.filter((kind) => kind === 'leaf').length;
+      const expectedCellBytes = leafCount * 2 * Int16Array.BYTES_PER_ELEMENT;
       if (message.epoch !== state.epoch
-        || !(message.terminalBuffer instanceof ArrayBuffer)
-        || message.terminalBuffer.byteLength !== state.terminalByteLength
-        || message.terminalBuffer.byteLength !== expectedByteLength) {
+        || !(message.terminalPositionBuffer instanceof ArrayBuffer)
+        || message.terminalPositionBuffer.byteLength !== state.terminalPositionByteLength
+        || message.terminalPositionBuffer.byteLength !== expectedPositionBytes
+        || !(message.terminalCellBuffer instanceof ArrayBuffer)
+        || message.terminalCellBuffer.byteLength !== state.terminalCellByteLength
+        || message.terminalCellBuffer.byteLength !== expectedCellBytes) {
         sendFailure(state.requestId, { code: 'PROTOCOL_ERROR', details: { reason: 'terminal-buffer-mismatch' } });
-        state.session.dispose();
-        active = null;
+        disposeState(state);
         return;
       }
       state.phase = 'retained-settled';
       state.epoch = message.epoch ?? state.session.state.epoch;
       state.session.state.phase = 'settled';
-      state.terminalByteLength = 0;
+      state.terminalPositionByteLength = 0;
+      state.terminalCellByteLength = 0;
       return;
     }
     if (message.type === 'cancel' || message.type === 'dispose') {
-      state.session.dispose();
-      active = null;
+      disposeState(state);
     }
   }
 
