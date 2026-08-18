@@ -1,13 +1,15 @@
 import * as THREE from 'three';
 
 import { adaptSchoolData } from './data.js';
-import { HEX_SIZE, axialToPlane } from './hex.js';
+import { HEX_SIZE, axialToPlane, planeToAxial, fractionalAxialRadius } from './hex.js';
 import { calculateLayout, layoutAlgorithms } from './layout.js';
+import { calculateAssignmentHash } from './force-layout.js';
 
 const WATER_LEVEL = 0.12;
 const MIN_TILE_HEIGHT = 0.55;
 const MAX_TILE_HEIGHT = 6.2;
 const MAX_GRID_RADIUS = 256;
+const MAX_VIEWPORT_GRID_RADIUS = 28;
 const MAX_SPRING_COUNT = 5999;
 
 const COLOR_PALETTE = Object.freeze([
@@ -245,6 +247,22 @@ function createOwnershipLedger() {
     return material;
   }
 
+  function releaseObject(object) {
+    if (!objects.delete(object)) return;
+    object.removeFromParent();
+    if (typeof object.dispose === 'function') object.dispose();
+  }
+
+  function releaseGeometry(geometry) {
+    if (!geometries.delete(geometry)) return;
+    geometry.dispose();
+  }
+
+  function releaseMaterial(material) {
+    if (!materials.delete(material)) return;
+    material.dispose();
+  }
+
   function dispose() {
     if (disposed) return;
     disposed = true;
@@ -272,7 +290,7 @@ function createOwnershipLedger() {
     if (firstError) throw firstError;
   }
 
-  return { ownObject, ownGeometry, ownMaterial, dispose };
+  return { ownObject, ownGeometry, ownMaterial, releaseObject, releaseGeometry, releaseMaterial, dispose };
 }
 
 function noise(q, r) {
@@ -287,31 +305,227 @@ function smoothNoise(q, r) {
   ) * 0.11;
 }
 
-function validateForceTopology(topology, terminalFrame, layoutResult, visualPayloadByEntityId) {
-  if (!isRecord(topology) || !Array.isArray(topology.nodeIds) || !Array.isArray(topology.nodeKinds) || !Array.isArray(topology.relations)) {
-    failValidation('INVALID_FORCE_TOPOLOGY');
+function computeViewportGroundRadius(camera, world) {
+  const groundY = WATER_LEVEL;
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  const camToGround = groundY - camera.position.y;
+  if (Math.abs(forward.y) < 1e-6 || camToGround * forward.y >= 0) {
+    return 0;
   }
-  if (topology.nodeIds.length === 0 || topology.nodeIds.length !== topology.nodeKinds.length) failValidation('INVALID_FORCE_TOPOLOGY');
-  if (!terminalFrame || !(terminalFrame.positions instanceof Float32Array) || terminalFrame.positions.length !== topology.nodeIds.length * 2) failValidation('INVALID_TERMINAL_FRAME');
-  if (!layoutResult || layoutResult.mode !== 'force-anchors') failValidation('INVALID_FORCE_LAYOUT_RESULT');
-  const leaves = topology.nodeIds.filter((_, index) => topology.nodeKinds[index] === 'leaf');
-  if (layoutResult.placements.length !== leaves.length || visualPayloadByEntityId.size !== leaves.length) failValidation('INVALID_FORCE_PLACEMENTS');
-  const leafIds = new Set(leaves);
-  const cells = new Set();
-  for (const placement of layoutResult.placements) {
-    if (!leafIds.has(placement.entityId) || !Number.isSafeInteger(placement.q) || !Number.isSafeInteger(placement.r)) failValidation('INVALID_FORCE_PLACEMENT');
-    const key = `${placement.q},${placement.r}`;
-    if (cells.has(key)) failValidation('DUPLICATE_FORCE_CELL');
-    cells.add(key);
-    if (!visualPayloadByEntityId.has(placement.entityId)) failValidation('MISSING_VISUAL_PAYLOAD', { entityId: placement.entityId });
-    const nodeIndex = topology.nodeIds.indexOf(placement.entityId);
-    const center = axialToPlane(placement.q, placement.r);
-    if (nodeIndex < 0 || terminalFrame.positions[nodeIndex * 2] !== Math.fround(center.x) || terminalFrame.positions[nodeIndex * 2 + 1] !== Math.fround(center.z)) {
-      failValidation('TERMINAL_CENTER_MISMATCH', { entityId: placement.entityId });
+  const t = camToGround / forward.y;
+  const groundHit = new THREE.Vector3().copy(forward).multiplyScalar(t).add(camera.position);
+  const worldOffset = world.position.x;
+
+  const corners = [
+    new THREE.Vector2(-1, 1),
+    new THREE.Vector2(1, 1),
+    new THREE.Vector2(-1, -1),
+    new THREE.Vector2(1, -1),
+  ];
+
+  let minQ = Infinity;
+  let maxQ = -Infinity;
+  let minR = Infinity;
+  let maxR = -Infinity;
+  const raycaster = new THREE.Raycaster();
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -groundY);
+  const intersection = new THREE.Vector3();
+
+  for (const corner of corners) {
+    raycaster.setFromCamera(corner, camera);
+    if (raycaster.ray.intersectPlane(groundPlane, intersection)) {
+      const axial = planeToAxial(intersection.x - worldOffset, intersection.z);
+      const fq = fractionalAxialRadius(axial.q, axial.r);
+      const fr = fractionalAxialRadius(axial.r, -axial.q - axial.r);
+      const fs = fractionalAxialRadius(-axial.q - axial.r, axial.q);
+      minQ = Math.min(minQ, fq);
+      maxQ = Math.max(maxQ, fq);
+      minR = Math.min(minR, fr);
+      maxR = Math.max(maxR, fr);
     }
   }
+
+  if (!Number.isFinite(maxQ) && !Number.isFinite(maxR)) {
+    return 0;
+  }
+
+  const viewportRadius = Math.ceil(Math.max(
+    Number.isFinite(maxQ) ? maxQ : 0,
+    Number.isFinite(maxR) ? maxR : 0,
+  ) + 1);
+  return Math.min(viewportRadius, MAX_VIEWPORT_GRID_RADIUS);
+}
+
+function createEmptyCellGrid(ownership, gridRadius, occupiedCells, viewportRadius = 0) {
+  const effectiveRadius = Math.max(
+    gridRadius > 0 ? gridRadius : 3,
+    viewportRadius,
+  );
+
+  const emptyCellPositions = [];
+  for (let q = -effectiveRadius; q <= effectiveRadius; q += 1) {
+    const minR = Math.max(-effectiveRadius, -q - effectiveRadius);
+    const maxR = Math.min(effectiveRadius, -q + effectiveRadius);
+    for (let r = minR; r <= maxR; r += 1) {
+      if (!occupiedCells.has(`${q},${r}`)) emptyCellPositions.push({ q, r });
+    }
+  }
+
+  const emptyGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(
+    HEX_SIZE * 0.96,
+    HEX_SIZE * 0.96,
+    0.05,
+    6,
+  ));
+  const emptyMaterial = ownership.ownMaterial(new THREE.MeshBasicMaterial({
+    color: 0x4fa98c,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
+  }));
+  const emptyTiles = ownership.ownObject(new THREE.InstancedMesh(
+    emptyGeometry,
+    emptyMaterial,
+    emptyCellPositions.length,
+  ));
+  const emptyInstances = new Array(emptyCellPositions.length);
+  const emptyBaseColors = new Float32Array(emptyCellPositions.length * 3);
+  const emptyColor = new THREE.Color(0x4fa98c);
+  const matrix = new THREE.Matrix4();
+  const position = new THREE.Vector3();
+  const scale = new THREE.Vector3();
+  const rotation = new THREE.Quaternion();
+
+  emptyCellPositions.forEach(({ q, r }, index) => {
+    const { x, z } = axialToPlane(q, r);
+    position.set(x, WATER_LEVEL + 0.015, z);
+    scale.set(1, 1, 1);
+    matrix.compose(position, rotation, scale);
+    emptyTiles.setMatrixAt(index, matrix);
+    emptyTiles.setColorAt(index, emptyColor);
+    emptyColor.toArray(emptyBaseColors, index * 3);
+    emptyInstances[index] = {
+      q,
+      r,
+      x,
+      y: WATER_LEVEL + 0.015,
+      z,
+      depth: 0.05,
+      isEmpty: true,
+    };
+  });
+  emptyTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
+  emptyTiles.userData = { isEmpty: true, instances: emptyInstances, baseColors: emptyBaseColors };
+  emptyTiles.renderOrder = 2;
+  emptyTiles.computeBoundingSphere();
+
+  return { mesh: emptyTiles, instances: emptyInstances, baseColors: emptyBaseColors };
+}
+
+function validateForceTopology(topology, visualPayloadByEntityId) {
+  if (!isRecord(topology) || !Array.isArray(topology.nodeIds) || !Array.isArray(topology.nodeKinds) || !Array.isArray(topology.relations)
+    || topology.nodeIds.length === 0 || topology.nodeIds.length !== topology.nodeKinds.length) {
+    failValidation('INVALID_FORCE_TOPOLOGY');
+  }
+  const ids = new Set();
+  const leafIndices = [];
+  const leafIds = [];
+  const leafOrdinalByNode = new Int32Array(topology.nodeIds.length);
+  leafOrdinalByNode.fill(-1);
+  for (let index = 0; index < topology.nodeIds.length; index += 1) {
+    const id = topology.nodeIds[index];
+    const kind = topology.nodeKinds[index];
+    if (typeof id !== 'string' || id.length === 0 || ids.has(id) || (kind !== 'leaf' && kind !== 'anchor')) failValidation('INVALID_FORCE_TOPOLOGY');
+    ids.add(id);
+    if (kind === 'leaf') {
+      leafOrdinalByNode[index] = leafIds.length;
+      leafIndices.push(index);
+      leafIds.push(id);
+    }
+  }
+  if (visualPayloadByEntityId.size !== leafIds.length) failValidation('INVALID_FORCE_PLACEMENTS');
+  for (const leafId of leafIds) {
+    if (!visualPayloadByEntityId.has(leafId)) failValidation('MISSING_VISUAL_PAYLOAD', { entityId: leafId });
+    validatePayload(visualPayloadByEntityId.get(leafId), leafId);
+  }
   for (const relation of topology.relations) {
-    if (!Number.isSafeInteger(relation.sourceIndex) || !Number.isSafeInteger(relation.targetIndex) || relation.sourceIndex < 0 || relation.targetIndex < 0 || relation.sourceIndex >= topology.nodeIds.length || relation.targetIndex >= topology.nodeIds.length) failValidation('INVALID_FORCE_RELATION');
+    if (!Number.isSafeInteger(relation.sourceIndex) || !Number.isSafeInteger(relation.targetIndex)
+      || relation.sourceIndex < 0 || relation.targetIndex < 0
+      || relation.sourceIndex >= topology.nodeIds.length || relation.targetIndex >= topology.nodeIds.length) {
+      failValidation('INVALID_FORCE_RELATION');
+    }
+  }
+  return { leafIndices, leafIds, leafOrdinalByNode };
+}
+
+function createForceFrameScratch(topology, leafCount) {
+  return {
+    x: new Float32Array(leafCount),
+    z: new Float32Array(leafCount),
+    q: new Int16Array(leafCount),
+    r: new Int16Array(leafCount),
+    springPositions: new Float32Array(topology.relations.length * 6),
+    cellIndexes: new Set(),
+    gridRadius: 0,
+  };
+}
+
+function validateForceFrame(topology, topologyInfo, frame, expectedGlobalStep, scratch) {
+  if (!isRecord(frame) || frame.requestId !== topology.requestId
+    || !Number.isSafeInteger(frame.globalStep) || frame.globalStep < 0
+    || (expectedGlobalStep !== null && frame.globalStep !== expectedGlobalStep)
+    || !(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2
+    || !(frame.leafCells instanceof Int16Array) || frame.leafCells.length !== topologyInfo.leafIds.length * 2
+    || !Number.isSafeInteger(frame.assignmentRevision) || frame.assignmentRevision < 0
+    || !Number.isSafeInteger(frame.assignmentHash)) {
+    failValidation('INVALID_FORCE_FRAME');
+  }
+  for (const value of frame.positions) if (!Number.isFinite(value)) failValidation('NONFINITE_FORCE_FRAME');
+  if (calculateAssignmentHash(topologyInfo.leafIds, frame.leafCells) !== frame.assignmentHash) failValidation('ASSIGNMENT_HASH_MISMATCH');
+
+  scratch.cellIndexes.clear();
+  scratch.gridRadius = 0;
+  for (let index = 0; index < topologyInfo.leafIds.length; index += 1) {
+    const q = frame.leafCells[index * 2];
+    const r = frame.leafCells[index * 2 + 1];
+    const radius = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
+    const cellIndex = (q + MAX_GRID_RADIUS) * (MAX_GRID_RADIUS * 2 + 1) + r + MAX_GRID_RADIUS;
+    if (radius > MAX_GRID_RADIUS) failValidation('LEAF_CELL_OUTSIDE_GRID', { entityId: topologyInfo.leafIds[index] });
+    if (scratch.cellIndexes.has(cellIndex)) failValidation('DUPLICATE_LEAF_CELL', { entityId: topologyInfo.leafIds[index] });
+    scratch.cellIndexes.add(cellIndex);
+    const center = axialToPlane(q, r);
+    scratch.q[index] = q;
+    scratch.r[index] = r;
+    scratch.x[index] = center.x;
+    scratch.z[index] = center.z;
+    scratch.gridRadius = Math.max(scratch.gridRadius, radius);
+  }
+
+  for (let index = 0; index < topology.relations.length; index += 1) {
+    const relation = topology.relations[index];
+    for (let endpoint = 0; endpoint < 2; endpoint += 1) {
+      const nodeIndex = endpoint === 0 ? relation.sourceIndex : relation.targetIndex;
+      const leafOrdinal = topologyInfo.leafOrdinalByNode[nodeIndex];
+      const offset = index * 6 + endpoint * 3;
+      scratch.springPositions[offset] = leafOrdinal >= 0 ? scratch.x[leafOrdinal] : frame.positions[nodeIndex * 2];
+      scratch.springPositions[offset + 1] = 0;
+      scratch.springPositions[offset + 2] = leafOrdinal >= 0 ? scratch.z[leafOrdinal] : frame.positions[nodeIndex * 2 + 1];
+    }
+  }
+  return scratch;
+}
+
+function validateStableForceResult(layoutResult, terminalFrame, topologyInfo) {
+  if (!isRecord(layoutResult) || layoutResult.mode !== 'force-anchors' || !Array.isArray(layoutResult.placements)
+    || layoutResult.placements.length !== topologyInfo.leafIds.length || terminalFrame.terminal !== 'converged') {
+    failValidation('INVALID_FORCE_LAYOUT_RESULT');
+  }
+  for (let index = 0; index < topologyInfo.leafIds.length; index += 1) {
+    const placement = layoutResult.placements[index];
+    if (placement?.entityId !== topologyInfo.leafIds[index]
+      || placement.q !== terminalFrame.leafCells[index * 2]
+      || placement.r !== terminalFrame.leafCells[index * 2 + 1]) failValidation('TERMINAL_PLACEMENT_MISMATCH');
   }
 }
 
@@ -325,164 +539,232 @@ function createForceIsland(input, stable) {
     presentation = { occupiedOpacity: 0.5, showSprings: true },
   } = input;
   if (!(visualPayloadByEntityId instanceof Map)) failValidation('INVALID_PAYLOAD_MAP');
-  if (!isRecord(presentation) || typeof presentation.showSprings !== 'boolean' || !Number.isFinite(presentation.occupiedOpacity)) failValidation('INVALID_PRESENTATION');
-  if (stable) validateForceTopology(topology, terminalFrame, layoutResult, visualPayloadByEntityId);
-  else {
-    if (!isRecord(topology) || !Array.isArray(topology.nodeIds) || !Array.isArray(topology.nodeKinds) || !Array.isArray(topology.relations)) failValidation('INVALID_FORCE_TOPOLOGY');
-    if (!initialFrame || !(initialFrame.positions instanceof Float32Array) || initialFrame.positions.length !== topology.nodeIds.length * 2) failValidation('INVALID_INITIAL_FRAME');
+  if (!isRecord(presentation) || typeof presentation.showSprings !== 'boolean'
+    || !Number.isFinite(presentation.occupiedOpacity) || presentation.occupiedOpacity < 0 || presentation.occupiedOpacity > 1) {
+    failValidation('INVALID_PRESENTATION');
   }
+  const topologyInfo = validateForceTopology(topology, visualPayloadByEntityId);
+  const frame = stable ? terminalFrame : initialFrame;
+  const scratch = createForceFrameScratch(topology, topologyInfo.leafIds.length);
+  validateForceFrame(topology, topologyInfo, frame, null, scratch);
+  if (stable) validateStableForceResult(layoutResult, terminalFrame, topologyInfo);
 
   const ownership = createOwnershipLedger();
-  const root = ownership.ownObject(new THREE.Group());
-  const leafIndices = [];
-  for (let index = 0; index < topology.nodeIds.length; index += 1) {
-    if (topology.nodeKinds[index] === 'leaf') leafIndices.push(index);
-  }
-  const occupiedGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, 1, 6, 1, false));
-  const translucent = presentation.occupiedOpacity < 1;
-  const occupiedMaterial = ownership.ownMaterial(new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    roughness: 0.84,
-    metalness: 0.02,
-    flatShading: true,
-    opacity: presentation.occupiedOpacity,
-    transparent: translucent,
-    depthWrite: !translucent,
-    fog: !translucent,
-    toneMapped: !translucent,
-  }));
-  const occupiedTiles = ownership.ownObject(new THREE.InstancedMesh(occupiedGeometry, occupiedMaterial, leafIndices.length));
-  const instances = new Array(leafIndices.length);
-  const nextX = new Float32Array(leafIndices.length);
-  const nextZ = new Float32Array(leafIndices.length);
-  const baseColors = new Float32Array(leafIndices.length * 3);
-  const matrix = new THREE.Matrix4();
-  const position = new THREE.Vector3();
-  const scale = new THREE.Vector3();
-  const rotation = new THREE.Quaternion();
-  const color = new THREE.Color();
-  let worldSize = 18;
-  const getHeight = (entityId, index) => {
-    const payload = validatePayload(visualPayloadByEntityId.get(entityId), entityId);
-    const normalizedHeight = Math.min(100, Math.max(0, payload.heightValue)) / 100;
-    const height = MIN_TILE_HEIGHT + normalizedHeight * (MAX_TILE_HEIGHT - MIN_TILE_HEIGHT);
-    color.set(COLOR_PALETTE[payload.colorGroupOrder % COLOR_PALETTE.length]);
-    return { payload: payload.payload, height, colorIndex: index };
-  };
-  const applyPosition = (frame, updateBounds = true) => {
-    if (!(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2) throw renderFailure('INVALID_FORCE_FRAME');
-    for (let index = 0; index < leafIndices.length; index += 1) {
-      const nodeIndex = leafIndices[index];
-      const x = frame.positions[nodeIndex * 2];
-      const z = frame.positions[nodeIndex * 2 + 1];
-      if (!Number.isFinite(x) || !Number.isFinite(z)) throw renderFailure('NONFINITE_FORCE_FRAME');
-      nextX[index] = x;
-      nextZ[index] = z;
-    }
-    for (let index = 0; index < leafIndices.length; index += 1) {
-      const x = nextX[index];
-      const z = nextZ[index];
-      const entityId = topology.nodeIds[leafIndices[index]];
-      const record = instances[index] || getHeight(entityId, index);
-      const depth = record.height + 1.4;
-      const y = record.height / 2 - 0.62;
-      position.set(x, y, z);
-      scale.set(1, depth, 1);
-      matrix.compose(position, rotation, scale);
-      occupiedTiles.setMatrixAt(index, matrix);
-      color.set(COLOR_PALETTE[record.payload.colorGroupOrder % COLOR_PALETTE.length]);
+  try {
+    const root = ownership.ownObject(new THREE.Group());
+    const occupiedGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(HEX_SIZE * 1.005, HEX_SIZE * 1.005, 1, 6, 1, false));
+    const translucent = presentation.occupiedOpacity < 1;
+    const occupiedMaterial = ownership.ownMaterial(new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.84,
+      metalness: 0.02,
+      flatShading: true,
+      opacity: presentation.occupiedOpacity,
+      transparent: translucent,
+      depthWrite: !translucent,
+      fog: !translucent,
+      toneMapped: !translucent,
+    }));
+    const occupiedTiles = ownership.ownObject(new THREE.InstancedMesh(occupiedGeometry, occupiedMaterial, topologyInfo.leafIds.length));
+    const instances = new Array(topologyInfo.leafIds.length);
+    const baseColors = new Float32Array(topologyInfo.leafIds.length * 3);
+    const currentLeafCells = new Int16Array(topologyInfo.leafIds.length * 2);
+    const occupiedCells = new Set();
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    const rotation = new THREE.Quaternion();
+    const color = new THREE.Color();
+    let worldSize = 18;
+    let gridRadius = 0;
+    let currentAssignmentRevision = -1;
+    let currentAssignmentHash = 0;
+
+    for (let index = 0; index < topologyInfo.leafIds.length; index += 1) {
+      const entityId = topologyInfo.leafIds[index];
+      const visual = validatePayload(visualPayloadByEntityId.get(entityId), entityId);
+      const normalizedHeight = Math.min(100, Math.max(0, visual.heightValue)) / 100;
+      const height = MIN_TILE_HEIGHT + normalizedHeight * (MAX_TILE_HEIGHT - MIN_TILE_HEIGHT);
+      instances[index] = { entityId, payload: visual.payload, q: 0, r: 0, x: 0, y: 0, z: 0, depth: 0, height };
+      color.set(COLOR_PALETTE[visual.colorGroupOrder % COLOR_PALETTE.length]);
       occupiedTiles.setColorAt(index, color);
       color.toArray(baseColors, index * 3);
-      if (!instances[index]) instances[index] = { entityId: topology.nodeIds[leafIndices[index]], payload: record.payload, x, y, z, depth, height: record.height };
-      else Object.assign(instances[index], { x, y, z, depth });
-      if (updateBounds) worldSize = Math.max(worldSize, Math.hypot(x, z) + HEX_SIZE * 2);
     }
-    occupiedTiles.userData = { instances, baseColors, nodeIndices: leafIndices };
-    occupiedTiles.instanceMatrix.needsUpdate = true;
-    if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
-    occupiedTiles.computeBoundingSphere();
-  };
-  applyPosition(stable ? terminalFrame : initialFrame);
-  occupiedTiles.castShadow = leafIndices.length <= 2500;
-  occupiedTiles.receiveShadow = true;
-  occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  occupiedTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
-  occupiedTiles.computeBoundingSphere();
-  root.add(occupiedTiles);
+    occupiedTiles.userData = { instances, baseColors, nodeIndices: topologyInfo.leafIndices };
+    occupiedTiles.castShadow = topologyInfo.leafIds.length <= 2500;
+    occupiedTiles.receiveShadow = true;
+    occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    occupiedTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
+    root.add(occupiedTiles);
 
-  const springPositions = new Float32Array(topology.relations.length * 6);
-  const springGeometry = ownership.ownGeometry(new THREE.BufferGeometry());
-  springGeometry.setAttribute('position', new THREE.BufferAttribute(springPositions, 3));
-  const springMaterial = ownership.ownMaterial(new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: true, depthWrite: false, transparent: true, opacity: 1, fog: false }));
-  const springs = topology.relations.length > 0 ? ownership.ownObject(new THREE.LineSegments(springGeometry, springMaterial)) : null;
-  if (springs) {
-    springs.raycast = () => {};
-    root.add(springs);
-  }
-  const updateSprings = (frame) => {
-    if (!springs) return;
-    for (let index = 0; index < topology.relations.length; index += 1) {
-      const relation = topology.relations[index];
-      const source = relation.sourceIndex * 2;
-      const target = relation.targetIndex * 2;
-      springPositions[index * 6] = frame.positions[source];
-      springPositions[index * 6 + 1] = 0;
-      springPositions[index * 6 + 2] = frame.positions[source + 1];
-      springPositions[index * 6 + 3] = frame.positions[target];
-      springPositions[index * 6 + 4] = 0;
-      springPositions[index * 6 + 5] = frame.positions[target + 1];
+    const emptyGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(HEX_SIZE * 0.96, HEX_SIZE * 0.96, 0.05, 6));
+    const emptyMaterial = ownership.ownMaterial(new THREE.MeshBasicMaterial({ color: 0x4fa98c, transparent: true, opacity: 0.18, depthWrite: false }));
+    const emptyColor = new THREE.Color(0x4fa98c);
+    let emptyTiles = null;
+    let emptyCapacity = 0;
+    let emptyInstances = [];
+    let emptyBaseColors = new Float32Array(0);
+    let viewportRadius = 0;
+    const minimumGridRadius = topologyInfo.leafIds.length >= 500 ? 25 : 3;
+    const interactiveTiles = [occupiedTiles];
+
+    const updateEmptyGrid = () => {
+      const effectiveRadius = Math.min(MAX_GRID_RADIUS, Math.max(gridRadius, minimumGridRadius, viewportRadius));
+      const requiredCapacity = 1 + 3 * effectiveRadius * (effectiveRadius + 1);
+      if (requiredCapacity > emptyCapacity) {
+        const oldMesh = emptyTiles;
+        emptyCapacity = requiredCapacity;
+        emptyInstances = new Array(emptyCapacity);
+        emptyBaseColors = new Float32Array(emptyCapacity * 3);
+        emptyTiles = ownership.ownObject(new THREE.InstancedMesh(emptyGeometry, emptyMaterial, emptyCapacity));
+        emptyTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        emptyTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
+        emptyTiles.renderOrder = 2;
+        if (oldMesh) {
+          const interactionIndex = interactiveTiles.indexOf(oldMesh);
+          ownership.releaseObject(oldMesh);
+          if (interactionIndex >= 0) interactiveTiles[interactionIndex] = emptyTiles;
+        } else interactiveTiles.push(emptyTiles);
+        root.add(emptyTiles);
+      }
+      let count = 0;
+      for (let q = -effectiveRadius; q <= effectiveRadius; q += 1) {
+        const minR = Math.max(-effectiveRadius, -q - effectiveRadius);
+        const maxR = Math.min(effectiveRadius, -q + effectiveRadius);
+        for (let r = minR; r <= maxR; r += 1) {
+          if (occupiedCells.has(`${q},${r}`)) continue;
+          const center = axialToPlane(q, r);
+          position.set(center.x, WATER_LEVEL + 0.015, center.z);
+          scale.set(1, 1, 1);
+          matrix.compose(position, rotation, scale);
+          emptyTiles.setMatrixAt(count, matrix);
+          emptyTiles.setColorAt(count, emptyColor);
+          emptyColor.toArray(emptyBaseColors, count * 3);
+          emptyInstances[count] ||= {};
+          Object.assign(emptyInstances[count], { q, r, x: center.x, y: WATER_LEVEL + 0.015, z: center.z, depth: 0.05, isEmpty: true });
+          count += 1;
+        }
+      }
+      emptyInstances.length = count;
+      emptyTiles.count = count;
+      emptyTiles.userData = { isEmpty: true, instances: emptyInstances, baseColors: emptyBaseColors };
+      emptyTiles.instanceMatrix.needsUpdate = true;
+      if (emptyTiles.instanceColor) emptyTiles.instanceColor.needsUpdate = true;
+      emptyTiles.computeBoundingSphere();
+    };
+
+    const springPositions = new Float32Array(topology.relations.length * 6);
+    const springGeometry = topology.relations.length > 0 ? ownership.ownGeometry(new THREE.BufferGeometry()) : null;
+    const springMaterial = topology.relations.length > 0 ? ownership.ownMaterial(new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: true, depthWrite: false, transparent: true, opacity: 1, fog: false })) : null;
+    const springs = topology.relations.length > 0 ? ownership.ownObject(new THREE.LineSegments(springGeometry, springMaterial)) : null;
+    if (springs) {
+      springGeometry.setAttribute('position', new THREE.BufferAttribute(springPositions, 3));
+      springs.raycast = () => {};
+      root.add(springs);
     }
-    springGeometry.attributes.position.needsUpdate = true;
-    springGeometry.computeBoundingSphere();
-    springGeometry.computeBoundingBox();
-  };
-  updateSprings(stable ? terminalFrame : initialFrame);
-  let lastGlobalStep = stable ? terminalFrame.globalStep : initialFrame.globalStep;
-  let retired = false;
-  let isStable = stable;
-  const handle = {
-    requestId: topology.requestId,
-    root,
-    interactiveTiles: [occupiedTiles],
-    applyStep(frame) {
-      if (retired) throw renderFailure('RETIRED_ISLAND');
-      if (frame.requestId !== topology.requestId || frame.globalStep !== lastGlobalStep + 1) throw renderFailure('INVALID_FORCE_STEP', { expected: lastGlobalStep + 1, actual: frame.globalStep });
-      for (const value of frame.positions) if (!Number.isFinite(value)) throw renderFailure('NONFINITE_FORCE_FRAME');
-      applyPosition(frame);
-      updateSprings(frame);
-      lastGlobalStep = frame.globalStep;
-    },
-    promote(terminal) {
-      if (retired) throw renderFailure('PROMOTE_DISPOSED');
-      if (isStable) throw renderFailure('PROMOTE_ALREADY_STABLE');
-      isStable = true;
-      retired = true;
-      handle.terminalFrame = terminal;
-      handle.stable = true;
-      return handle;
-    },
-    inspectCurrentFrame() {
-      return {
-        requestId: topology.requestId,
-        globalStep: lastGlobalStep,
-        positions: leafIndices.flatMap((nodeIndex) => [instances[leafIndices.indexOf(nodeIndex)].x, instances[leafIndices.indexOf(nodeIndex)].z]),
-        springPositions: springs ? Array.from(springPositions) : [],
-      };
-    },
-    retire() {
-      retired = true;
-      root.removeFromParent();
-    },
-    dispose() {
-      if (!retired) retired = true;
-      ownership.dispose();
-    },
-    stats: layoutResult?.stats ?? { occupiedCount: leafIndices.length, boundaryGaps: [] },
-    worldSize,
-    stable: isStable,
-    terminalFrame: stable ? terminalFrame : null,
-  };
-  return handle;
+
+    const commitPreparedFrame = (preparedFrame, prepared) => {
+      const assignmentsChanged = preparedFrame.assignmentRevision !== currentAssignmentRevision;
+      if (!assignmentsChanged && preparedFrame.assignmentHash !== currentAssignmentHash) failValidation('ASSIGNMENT_REVISION_MISMATCH');
+      if (preparedFrame.assignmentRevision < currentAssignmentRevision) failValidation('STALE_ASSIGNMENT_REVISION');
+      if (assignmentsChanged) {
+        occupiedCells.clear();
+        for (let index = 0; index < instances.length; index += 1) {
+          const record = instances[index];
+          const q = prepared.q[index];
+          const r = prepared.r[index];
+          const x = prepared.x[index];
+          const z = prepared.z[index];
+          const depth = record.height + 1.4;
+          const y = record.height / 2 - 0.62;
+          position.set(x, y, z);
+          scale.set(1, depth, 1);
+          matrix.compose(position, rotation, scale);
+          occupiedTiles.setMatrixAt(index, matrix);
+          Object.assign(record, { q, r, x, y, z, depth });
+          occupiedCells.add(`${q},${r}`);
+          worldSize = Math.max(worldSize, Math.hypot(x, z) + HEX_SIZE * 2);
+        }
+        currentLeafCells.set(preparedFrame.leafCells);
+        currentAssignmentRevision = preparedFrame.assignmentRevision;
+        currentAssignmentHash = preparedFrame.assignmentHash;
+        gridRadius = prepared.gridRadius;
+        occupiedTiles.instanceMatrix.needsUpdate = true;
+        if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
+        occupiedTiles.computeBoundingSphere();
+        updateEmptyGrid();
+      }
+      if (springs) {
+        springPositions.set(prepared.springPositions);
+        springGeometry.attributes.position.needsUpdate = true;
+        springGeometry.computeBoundingSphere();
+        springGeometry.computeBoundingBox();
+      }
+    };
+
+    commitPreparedFrame(frame, scratch);
+    let lastGlobalStep = frame.globalStep;
+    let retired = false;
+    const handle = {
+      requestId: topology.requestId,
+      root,
+      interactiveTiles,
+      get leafCells() { return currentLeafCells; },
+      applyStep(nextFrame) {
+        if (retired) throw renderFailure('RETIRED_ISLAND');
+        validateForceFrame(topology, topologyInfo, nextFrame, lastGlobalStep + 1, scratch);
+        commitPreparedFrame(nextFrame, scratch);
+        lastGlobalStep = nextFrame.globalStep;
+      },
+      inspectCurrentFrame() {
+        return {
+          requestId: topology.requestId,
+          globalStep: lastGlobalStep,
+          assignmentRevision: currentAssignmentRevision,
+          assignmentHash: currentAssignmentHash,
+          leafCells: Array.from(currentLeafCells),
+          towers: instances.map(({ entityId, q, r, x, z }) => ({ entityId, q, r, x, z })),
+          occupiedCells: [...occupiedCells].sort(),
+          emptyCellCount: emptyTiles?.count ?? 0,
+          springPositions: Array.from(springPositions),
+          resourceCounts: { geometries: topology.relations.length > 0 ? 3 : 2, materials: topology.relations.length > 0 ? 3 : 2, meshes: topology.relations.length > 0 ? 3 : 2 },
+          resourceIdentity: {
+            occupiedMesh: occupiedTiles.uuid,
+            occupiedGeometry: occupiedGeometry.uuid,
+            occupiedMaterial: occupiedMaterial.uuid,
+            emptyMesh: emptyTiles?.uuid ?? null,
+            emptyGeometry: emptyGeometry.uuid,
+            emptyMaterial: emptyMaterial.uuid,
+          },
+          gridCapacity: emptyCapacity,
+        };
+      },
+      retire() {
+        if (retired) return;
+        retired = true;
+        root.removeFromParent();
+      },
+      dispose() {
+        if (!retired) retired = true;
+        ownership.dispose();
+      },
+      updateViewportRadius(camera, world) {
+        const nextRadius = Math.min(MAX_GRID_RADIUS, computeViewportGroundRadius(camera, world));
+        if (nextRadius === viewportRadius) return;
+        viewportRadius = nextRadius;
+        updateEmptyGrid();
+      },
+      stats: layoutResult?.stats ?? { occupiedCount: topologyInfo.leafIds.length, boundaryGaps: [] },
+      worldSize,
+      stable,
+      terminalFrame: stable ? terminalFrame : null,
+    };
+    return handle;
+  } catch (cause) {
+    try { ownership.dispose(); } catch {}
+    if (cause?.code === 'RENDER_FAILED') throw cause;
+    throw renderFailure('CONSTRUCTION_FAILED', {}, cause);
+  }
 }
 
 export function createLiveIsland(input) {
@@ -573,60 +855,15 @@ export function createIsland(input) {
     root.add(occupiedTiles);
     interactiveTiles.push(occupiedTiles);
 
-    const emptyCellPositions = [];
-    for (let q = -validated.gridRadius; q <= validated.gridRadius; q += 1) {
-      const minR = Math.max(-validated.gridRadius, -q - validated.gridRadius);
-      const maxR = Math.min(validated.gridRadius, -q + validated.gridRadius);
-      for (let r = minR; r <= maxR; r += 1) {
-        if (!validated.occupiedCells.has(`${q},${r}`)) emptyCellPositions.push({ q, r });
-      }
-    }
-
-    const emptyGeometry = ownership.ownGeometry(new THREE.CylinderGeometry(
-      HEX_SIZE * 0.96,
-      HEX_SIZE * 0.96,
-      0.035,
-      6,
-    ));
-    const emptyMaterial = ownership.ownMaterial(new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.12,
-      depthWrite: false,
-    }));
-    const emptyTiles = ownership.ownObject(new THREE.InstancedMesh(
-      emptyGeometry,
-      emptyMaterial,
-      emptyCellPositions.length,
-    ));
-    const emptyInstances = new Array(emptyCellPositions.length);
-    const emptyBaseColors = new Float32Array(emptyCellPositions.length * 3);
-    const emptyColor = new THREE.Color(0x4fa98c);
-
-    emptyCellPositions.forEach(({ q, r }, index) => {
-      const { x, z } = axialToPlane(q, r);
-      position.set(x, WATER_LEVEL + 0.015, z);
-      scale.set(1, 1, 1);
-      matrix.compose(position, rotation, scale);
-      emptyTiles.setMatrixAt(index, matrix);
-      emptyTiles.setColorAt(index, emptyColor);
-      emptyColor.toArray(emptyBaseColors, index * 3);
-      emptyInstances[index] = {
-        q,
-        r,
-        x,
-        y: WATER_LEVEL + 0.015,
-        z,
-        depth: 0.035,
-        isEmpty: true,
-      };
-    });
-    emptyTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
-    emptyTiles.userData = { isEmpty: true, instances: emptyInstances, baseColors: emptyBaseColors };
-    emptyTiles.renderOrder = 2;
-    emptyTiles.computeBoundingSphere();
+    const { mesh: emptyTiles, baseColors: emptyBaseColors } = createEmptyCellGrid(
+      ownership,
+      validated.gridRadius,
+      validated.occupiedCells,
+    );
     root.add(emptyTiles);
     interactiveTiles.push(emptyTiles);
+
+    let currentEmptyTiles = emptyTiles;
 
     const waterGeometry = ownership.ownGeometry(new THREE.PlaneGeometry(10000, 10000));
     const waterOpacity = isTranslucent ? 0.0 : 0.86;
@@ -740,6 +977,74 @@ export function createIsland(input) {
       worldSize,
       stats: validated.stats,
       dispose: ownership.dispose,
+      inspectCurrentFrame() {
+        let geometries = 0;
+        let materials = 0;
+        let meshes = 0;
+        root.traverse((object) => {
+          if (object.geometry) geometries += 1;
+          if (object.material) materials += Array.isArray(object.material) ? object.material.length : 1;
+          if (object.isMesh || object.isLineSegments) meshes += 1;
+        });
+        return {
+          requestId: input.layoutResult.requestId,
+          globalStep: input.layoutResult.diagnostics?.globalStep ?? 0,
+          assignmentRevision: input.layoutResult.diagnostics?.assignmentRevision ?? 0,
+          assignmentHash: input.layoutResult.diagnostics?.assignmentHash ?? null,
+          leafCells: instances.flatMap(({ q, r }) => [q, r]),
+          towers: instances.map(({ payload, q, r, x, z }) => ({ entityId: payload.entityId, q, r, x, z })),
+          occupiedCells: [...validated.occupiedCells].sort(),
+          springPositions: [],
+          emptyCellCount: currentEmptyTiles.count,
+          resourceCounts: { geometries, materials, meshes },
+          resourceIdentity: {
+            occupiedMesh: occupiedTiles.uuid,
+            occupiedGeometry: tileGeometry.uuid,
+            occupiedMaterial: tileMaterial.uuid,
+            emptyMesh: currentEmptyTiles.uuid,
+            emptyGeometry: currentEmptyTiles.geometry.uuid,
+            emptyMaterial: currentEmptyTiles.material.uuid,
+          },
+          gridCapacity: currentEmptyTiles.instanceMatrix.count,
+        };
+      },
+      _viewportState: {
+        ownership,
+        gridRadius: validated.gridRadius,
+        occupiedCells: validated.occupiedCells,
+        root,
+        currentEmptyTiles,
+        interactiveTiles,
+        viewportRadius: 0,
+      },
+      updateViewportRadius(camera, world) {
+        const vs = this._viewportState;
+        if (!vs) return;
+        const viewportRadius = computeViewportGroundRadius(camera, world);
+        if (viewportRadius === vs.viewportRadius) return;
+        vs.viewportRadius = viewportRadius;
+        const effectiveRadius = Math.max(
+          vs.gridRadius > 0 ? vs.gridRadius : 3,
+          viewportRadius,
+        );
+        const oldMesh = vs.currentEmptyTiles;
+        const oldGeometry = oldMesh.geometry;
+        const oldMaterial = oldMesh.material;
+        vs.ownership.releaseObject(oldMesh);
+        vs.ownership.releaseGeometry(oldGeometry);
+        vs.ownership.releaseMaterial(oldMaterial);
+        const { mesh: newMesh } = createEmptyCellGrid(
+          vs.ownership,
+          vs.gridRadius,
+          vs.occupiedCells,
+          viewportRadius,
+        );
+        vs.root.add(newMesh);
+        const idx = vs.interactiveTiles.indexOf(oldMesh);
+        if (idx !== -1) vs.interactiveTiles[idx] = newMesh;
+        vs.currentEmptyTiles = newMesh;
+        currentEmptyTiles = newMesh;
+      },
     };
   } catch (cause) {
     try {
