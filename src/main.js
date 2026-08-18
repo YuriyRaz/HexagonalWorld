@@ -120,6 +120,31 @@ function fitWorldView(worldSize) {
 let hoveredTile = null;
 let selectedTile = null;
 
+const VIEWPORT_GRID_THROTTLE_MS = 100;
+let viewportGridTimerId = null;
+let viewportGridPending = false;
+
+function scheduleViewportGridUpdate(requestId = requestIdCounter, handle = activeIslandHandle) {
+  if (!handle?.updateViewportRadius) return;
+  if (viewportGridPending) return;
+  viewportGridPending = true;
+  viewportGridTimerId = setTimeout(() => {
+    viewportGridPending = false;
+    viewportGridTimerId = null;
+    if (requestId === requestIdCounter && handle === activeIslandHandle && handle.updateViewportRadius) {
+      handle.updateViewportRadius(camera, world);
+    }
+  }, VIEWPORT_GRID_THROTTLE_MS);
+}
+
+function disposeViewportGridListener() {
+  if (viewportGridTimerId !== null) {
+    clearTimeout(viewportGridTimerId);
+    viewportGridTimerId = null;
+  }
+  viewportGridPending = false;
+}
+
 function getEntityIdFromTile(tile) {
   if (!tile) return null;
   const { object, instanceId } = tile;
@@ -177,6 +202,7 @@ let waterRings = [];
 
 controls.addEventListener('change', () => {
   interactionDirty = true;
+  scheduleViewportGridUpdate();
 });
 
 function formatGap(value) {
@@ -212,8 +238,6 @@ function setForcePresentationMode(enabled) {
   renderer.shadowMap.enabled = !enabled;
   if (!enabled) renderer.shadowMap.needsUpdate = true;
   if (particles) particles.visible = !enabled;
-  if (enabled && activeIslandHandle) activeIslandHandle.root.visible = false;
-  if (!enabled && activeIslandHandle) activeIslandHandle.root.visible = true;
 }
 
 let workerMessageCount = 0;
@@ -232,13 +256,8 @@ const layoutRunner = createLayoutRunner({
   clearTimer: trackedClearTimer,
 });
 
-window.addEventListener('beforeunload', () => {
-  layoutRunner.dispose();
-});
-
-window.addEventListener('pagehide', () => {
-  layoutRunner.dispose();
-});
+window.addEventListener('beforeunload', disposeApplication);
+window.addEventListener('pagehide', disposeApplication);
 
 document.addEventListener('visibilitychange', () => {
   layoutRunner.setPresentationPaused(document.visibilityState === 'hidden');
@@ -252,6 +271,13 @@ let activeLiveIslandHandle = null;
 let initialSettlement = null;
 let forceTrace = [];
 let nextCommitOutcome = 'success';
+let renderedFrameCount = 0;
+let validatedResultAt = null;
+let firstAlignedSceneLatencyMs = null;
+let pendingAlignedRequestId = null;
+let renderMeasurement = null;
+let applicationDisposed = false;
+let animationFrameId = null;
 
 let requestIdCounter = 0;
 let lastErrorCode = null;
@@ -358,7 +384,19 @@ window.__hexWorldTest = {
     listenerCounts: { total: 17 },
     rootCount: world.children.filter((child) => child !== particles).length,
     lastControlReceipt: null,
+    renderedFrameCount,
+    firstAlignedSceneLatencyMs,
+    rendererMemory: { ...renderer.info.memory },
   }),
+  getAlignmentDiagnostics: () => activeIslandHandle?.inspectCurrentFrame?.() ?? null,
+  startRenderMeasurement: () => {
+    renderMeasurement = { count: 0, firstAt: null, lastAt: null };
+  },
+  stopRenderMeasurement: () => {
+    const result = renderMeasurement ? { ...renderMeasurement } : null;
+    renderMeasurement = null;
+    return result;
+  },
   setPresentationPaused: (paused) => layoutRunner.setPresentationPaused(paused),
 };
 
@@ -378,14 +416,31 @@ function paintReceipt(frame) {
       resolve({
         requestId: frame.requestId,
         globalStep: frame.globalStep,
-        buffer: frame.positions.buffer,
+        positionBuffer: frame.positions.buffer,
+        cellBuffer: frame.leafCells.buffer,
       });
     });
   });
 }
 
-function captureForceTrace(frame) {
+function captureForceTrace(frame, topology) {
   if (!new URLSearchParams(location.search).has('testDiagnostics')) return;
+  const alignment = activeLiveIslandHandle?.inspectCurrentFrame?.() ?? activeIslandHandle?.inspectCurrentFrame?.();
+  const springPositions = alignment?.springPositions ?? [];
+  const springEndpoints = topology?.relations?.map((relation, relationIndex) => {
+    const endpoint = (nodeIndex, offset) => ({
+      entityId: topology.nodeIds[nodeIndex],
+      kind: topology.nodeKinds[nodeIndex],
+      x: springPositions[relationIndex * 6 + offset],
+      z: springPositions[relationIndex * 6 + offset + 2],
+      simulationX: frame.positions[nodeIndex * 2],
+      simulationZ: frame.positions[nodeIndex * 2 + 1],
+    });
+    return {
+      source: endpoint(relation.sourceIndex, 0),
+      target: endpoint(relation.targetIndex, 3),
+    };
+  }) ?? [];
   forceTrace.push({
     requestId: frame.requestId,
     globalStep: frame.globalStep,
@@ -393,7 +448,16 @@ function captureForceTrace(frame) {
     coolingStep: frame.coolingStep,
     assignmentRevision: frame.assignmentRevision,
     assignmentHash: frame.assignmentHash,
-    positions: Array.from(frame.positions),
+    leafCells: Array.from(frame.leafCells),
+    nodePositions: Array.from(frame.positions),
+    towers: alignment?.towers ?? [],
+    occupiedCells: alignment?.occupiedCells ?? [],
+    springPositions,
+    springEndpoints,
+    emptyCellCount: alignment?.emptyCellCount ?? 0,
+    gridCapacity: alignment?.gridCapacity ?? 0,
+    resourceCounts: alignment?.resourceCounts ?? null,
+    resourceIdentity: alignment?.resourceIdentity ?? null,
     paintedAt: performance.now(),
     terminal: frame.terminal,
     controlWatermark: frame.appliedCommandSeq,
@@ -401,26 +465,30 @@ function captureForceTrace(frame) {
 }
 
 async function commitEpochSettlement(settlement) {
-  if (!activeLiveIslandHandle) {
-    throw Object.assign(new Error('No live island to promote.'), { code: 'RENDER_FAILED', details: { reason: 'no-live-island' } });
+  if (settlement.requestId !== requestIdCounter) throw Object.assign(new Error('Stale settlement.'), { code: 'CANCELLED' });
+  let candidate = activeLiveIslandHandle;
+  if (!candidate) {
+    candidate = createIsland({
+      visualPayloadByEntityId: activeVisualPayloadByEntityId,
+      topology: settlement.topology,
+      terminalFrame: settlement.terminalFrame,
+      layoutResult: settlement.result,
+      presentation: layoutAlgorithms['force-anchors'],
+    });
   }
   if (nextCommitOutcome === 'failure') {
     nextCommitOutcome = 'success';
+    if (candidate !== activeIslandHandle) candidate.dispose();
     throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
   }
-    const previous = activeIslandHandle;
-    activeLiveIslandHandle.promote(settlement.terminalFrame);
-    activeIslandHandle = activeLiveIslandHandle;
-    activeLiveIslandHandle = null;
-    activeLayoutResult = settlement.result;
-    tiles = activeIslandHandle.interactiveTiles;
-    waterRings = [];
-    if (previous && previous !== activeIslandHandle) {
-      world.remove(previous.root);
-      previous.dispose();
-    }
-    restoreSelectionByEntityId(activeIslandHandle.interactiveTiles);
-    layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
+  const previous = activeIslandHandle;
+  if (!world.children.includes(candidate.root)) world.add(candidate.root);
+  activeIslandHandle = candidate;
+  activeLiveIslandHandle = null;
+  activeLayoutResult = settlement.result;
+  tiles = candidate.interactiveTiles;
+  if (previous && previous !== candidate) previous.dispose();
+  layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
 }
 
 if (new URLSearchParams(location.search).has('testDiagnostics')) {
@@ -488,11 +556,15 @@ async function rebuildIsland() {
   requestIdCounter++;
   const currentRequestId = requestIdCounter;
 
+  disposeViewportGridListener();
   isBusy = true;
   setForcePresentationMode(algorithmSelect.value === 'force-anchors');
   lastErrorCode = null;
   initialSettlement = null;
   forceTrace = [];
+  validatedResultAt = null;
+  firstAlignedSceneLatencyMs = null;
+  pendingAlignedRequestId = null;
   const statusEl = document.querySelector('#layout-status');
   if (statusEl) {
     statusEl.textContent = 'Вычисляем...';
@@ -531,16 +603,20 @@ async function rebuildIsland() {
   }
 
   let candidateHandle = null;
-  let skipForcePresentationRestore = false;
   const previousActiveHandle = activeIslandHandle;
   try {
     const layoutConfig = config.failure 
       ? { __testFailure: config.failure } 
-      : (algorithmSelect.value === 'force-anchors' ? structuredClone(FORCE_LAYOUT_CONFIG_V2) : null);
+      : (algorithmSelect.value === 'force-anchors'
+        ? structuredClone(config.forceConfig ?? FORCE_LAYOUT_CONFIG_V2)
+        : null);
     if (layoutConfig && config.delayMs) {
       layoutConfig.delayMs = config.delayMs;
     }
 
+    let activeTopology = null;
+    let convergedStep = null;
+    const presentationMode = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'final-only' : 'all-steps';
     let layoutResult;
     if (config.layoutResult) {
       layoutResult = { ...config.layoutResult, requestId: currentRequestId };
@@ -552,8 +628,10 @@ async function rebuildIsland() {
         entities,
         config: layoutConfig
       }, isForce ? {
-        presentation: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'final-only' : 'all-steps',
+        presentation: presentationMode,
         onReady: (topology, frame) => {
+          if (currentRequestId !== requestIdCounter) return paintReceipt(frame);
+          activeTopology = topology;
           workerMessageCount++;
           if (activeLiveIslandHandle) activeLiveIslandHandle.dispose();
           activeLiveIslandHandle = createLiveIsland({
@@ -562,40 +640,57 @@ async function rebuildIsland() {
             initialFrame: frame,
             presentation: layoutAlgorithms['force-anchors'],
           });
+          previousActiveHandle?.root.removeFromParent();
           world.add(activeLiveIslandHandle.root);
           tiles = activeLiveIslandHandle.interactiveTiles;
           waterRings = [];
           updateForceProgress(frame);
           if (statusEl) statusEl.textContent = 'Вычисляем силу: показан шаг 0.';
           forceRelationshipHelp.textContent = 'Движущиеся линии показывают силовые связи, которые влияют на раскладку.';
-          captureForceTrace(frame);
+          captureForceTrace(frame, activeTopology);
           fitWorldView(activeLiveIslandHandle.worldSize);
           return paintReceipt(frame);
         },
         onStep: (frame) => {
+          if (currentRequestId !== requestIdCounter) return paintReceipt(frame);
           workerMessageCount++;
           activeLiveIslandHandle?.applyStep(frame);
           interactionDirty = true;
           updateForceProgress(frame);
-          captureForceTrace(frame);
+          captureForceTrace(frame, activeTopology);
+          if (frame.terminal === 'converged') {
+            if (convergedStep === null) convergedStep = frame.globalStep;
+            if (statusEl) {
+              const springCount = activeLiveIslandHandle?.root.children.find(c => c instanceof THREE.LineSegments)?.geometry.getAttribute('position').count / 2 ?? 0;
+              statusEl.textContent = `Раскладка сошлась на шаге ${convergedStep}. Активных связей: ${springCount}.`;
+              canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${springCount}. Башни полупрозрачные.`);
+            }
+          } else {
+            if (statusEl) {
+              statusEl.textContent = `Вычисляем силу: показан шаг ${frame.globalStep}.`;
+            }
+          }
           return paintReceipt(frame);
         },
         onEpochReady: (_metadata, frame) => {
+          if (currentRequestId !== requestIdCounter) return paintReceipt(frame);
+          convergedStep = null;
           workerMessageCount++;
-          const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-          activeLiveIslandHandle?.dispose();
-          activeLiveIslandHandle = createLiveIsland({ visualPayloadByEntityId, topology: initialSettlement.topology, initialFrame: frame, presentation: layoutAlgorithms['force-anchors'] });
-          world.add(activeLiveIslandHandle.root);
+          activeLiveIslandHandle = activeIslandHandle;
+          activeLiveIslandHandle.applyStep(frame);
           tiles = activeLiveIslandHandle.interactiveTiles;
           restoreSelectionByEntityId(activeLiveIslandHandle.interactiveTiles);
           interactionDirty = true;
           updateForceProgress(frame);
-          captureForceTrace(frame);
+          captureForceTrace(frame, activeTopology);
           return paintReceipt(frame);
         },
         onInitialSettled: (settlement) => {
+          if (currentRequestId !== requestIdCounter) return;
           workerMessageCount++;
           initialSettlement = settlement;
+          activeTopology = settlement.topology;
+          validatedResultAt = performance.now();
         },
       } : undefined);
     }
@@ -603,51 +698,58 @@ async function rebuildIsland() {
     if (currentRequestId !== requestIdCounter) return;
 
     const presentation = layoutAlgorithms[algorithmSelect.value];
-    if (algorithmSelect.value === 'force-anchors' && initialSettlement && activeLiveIslandHandle) {
+    if (algorithmSelect.value === 'force-anchors') {
+      if (config.layoutResult) {
+        candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+      } else if (!initialSettlement) {
+        throw Object.assign(new Error('Missing validated force settlement.'), { code: 'PROTOCOL_ERROR', details: { reason: 'missing-settlement' } });
+      } else if (presentationMode === 'final-only') {
+        candidateHandle = createIsland({
+          visualPayloadByEntityId,
+          topology: initialSettlement.topology,
+          terminalFrame: initialSettlement.terminalFrame,
+          layoutResult: initialSettlement.result,
+          presentation,
+        });
+      } else {
+        candidateHandle = activeLiveIslandHandle;
+      }
+      if (!candidateHandle) throw Object.assign(new Error('Missing force candidate.'), { code: 'RENDER_FAILED', details: { reason: 'missing-force-candidate' } });
       if (nextCommitOutcome === 'failure') {
         nextCommitOutcome = 'success';
         throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
       }
-      activeLiveIslandHandle.promote(initialSettlement.terminalFrame);
-      activeIslandHandle = activeLiveIslandHandle;
+      if (!world.children.includes(candidateHandle.root)) world.add(candidateHandle.root);
+      activeIslandHandle = candidateHandle;
       activeLiveIslandHandle = null;
       candidateHandle = null;
       activeLayoutResult = layoutResult;
       activeDataSnapshot = currentSchoolData;
       activeVisualPayloadByEntityId = visualPayloadByEntityId;
-      tiles = activeIslandHandle.interactiveTiles;
+      tiles = activeIslandHandle?.interactiveTiles ?? [];
       waterRings = [];
-      layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
+      if (initialSettlement) layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
+      if (initialSettlement) pendingAlignedRequestId = currentRequestId;
+      if (initialSettlement && presentationMode === 'final-only') captureForceTrace(initialSettlement.terminalFrame, initialSettlement.topology);
       if (previousActiveHandle && previousActiveHandle !== activeIslandHandle) {
         world.remove(previousActiveHandle.root);
         previousActiveHandle.dispose();
       }
       clearSelection();
-      skipForcePresentationRestore = true;
-    } else {
-      if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
-        candidateHandle = createIsland({
-          visualPayloadByEntityId,
-          layoutResult: initialSettlement.result,
-          topology: initialSettlement.topology,
-          terminalFrame: initialSettlement.terminalFrame,
-          presentation,
-        });
-      } else {
-        candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
+      scheduleViewportGridUpdate();
+      if (initialSettlement) updateForceProgress(initialSettlement.terminalFrame, layoutResult.diagnostics?.terminationReason || 'CONVERGED');
+      if (statusEl) {
+        statusEl.textContent = `Раскладка сошлась на шаге ${initialSettlement?.globalStep ?? layoutResult.diagnostics?.globalStep ?? 0}. Активных связей: ${layoutResult.springs.length}.`;
+        canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные.`);
       }
+    } else {
+      candidateHandle = createIsland({ visualPayloadByEntityId, layoutResult, presentation });
       if (currentRequestId !== requestIdCounter) {
         candidateHandle.dispose();
         candidateHandle = null;
         return;
       }
 
-      if (algorithmSelect.value === 'force-anchors' && initialSettlement && nextCommitOutcome === 'failure') {
-        nextCommitOutcome = 'success';
-        candidateHandle.dispose();
-        candidateHandle = null;
-        throw Object.assign(new Error('Stable scene commit failed.'), { code: 'RENDER_FAILED', details: { reason: 'test-commit-failure' } });
-      }
       world.add(candidateHandle.root);
       activeIslandHandle = candidateHandle;
       candidateHandle = null;
@@ -656,15 +758,13 @@ async function rebuildIsland() {
       activeVisualPayloadByEntityId = visualPayloadByEntityId;
       tiles = activeIslandHandle.interactiveTiles;
       waterRings = activeIslandHandle.waterRings || [];
+      scheduleViewportGridUpdate();
 
       if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) {
         activeLiveIslandHandle.dispose();
         activeLiveIslandHandle = null;
       }
       setForcePresentationMode(false);
-      if (algorithmSelect.value === 'force-anchors' && initialSettlement) {
-        layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
-      }
       if (previousActiveHandle) {
         world.remove(previousActiveHandle.root);
         previousActiveHandle.dispose();
@@ -677,18 +777,9 @@ async function rebuildIsland() {
       updateWorldSummary(activeIslandHandle.stats, activeDataSnapshot);
     }
     if (statusEl) {
-      if (layoutResult.mode === 'force-anchors') {
-        const finalStep = layoutResult.diagnostics?.globalStep ?? layoutResult.diagnostics?.iterations ?? 0;
-        const msg = `Раскладка сошлась на финальном шаге ${finalStep}. Активных связей: ${layoutResult.springs.length}.`;
-        statusEl.textContent = msg;
-        canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${layoutResult.springs.length}. Башни полупрозрачные.`);
-      } else {
+      if (layoutResult.mode !== 'force-anchors') {
         statusEl.textContent = 'Успешно завершено.';
         canvas.setAttribute('aria-label', 'Интерактивная трехмерная карта острова');
-      }
-      if (algorithmSelect.value === 'force-anchors') {
-        updateForceProgress(initialSettlement?.terminalFrame, layoutResult.diagnostics?.terminationReason || 'CONVERGED');
-        progressFields.get('terminal')?.replaceChildren(`Причина: ${layoutResult.diagnostics?.terminationReason || 'CONVERGED'}`);
       }
       statusEl.classList.remove('is-error');
     }
@@ -705,6 +796,7 @@ async function rebuildIsland() {
     }
     activeLiveIslandHandle?.dispose();
     activeLiveIslandHandle = null;
+    if (previousActiveHandle && !world.children.includes(previousActiveHandle.root)) world.add(previousActiveHandle.root);
     setForcePresentationMode(false);
     if (algorithmSelect.value === 'force-anchors') layoutRunner.cancelActiveLayout('render failure');
     console.error('rebuildIsland error:', err);
@@ -723,7 +815,7 @@ async function rebuildIsland() {
   } finally {
     if (currentRequestId === requestIdCounter) {
       isBusy = false;
-      if (!skipForcePresentationRestore) setForcePresentationMode(false);
+      if (algorithmSelect.value !== 'force-anchors') setForcePresentationMode(false);
       generatorForm.removeAttribute('aria-busy');
     }
   }
@@ -937,6 +1029,7 @@ function onResize() {
   camera.updateProjectionMatrix();
   renderer.setPixelRatio(devicePixelRatio);
   renderer.setSize(innerWidth, innerHeight);
+  scheduleViewportGridUpdate();
 }
 
 addEventListener('resize', onResize);
@@ -945,7 +1038,9 @@ const clock = new THREE.Clock();
 const cameraDirection = new THREE.Vector3();
 let frameStartTime = 0;
 function animate(time) {
-requestAnimationFrame(animate);
+  if (applicationDisposed) return;
+  animationFrameId = requestAnimationFrame(animate);
+  renderedFrameCount += 1;
   frameStartTime = performance.now();
   const elapsed = clock.getElapsedTime();
   animateCamera(time);
@@ -962,6 +1057,35 @@ requestAnimationFrame(animate);
   compassDial.style.transform = `rotate(${-heading}deg)`;
 
   renderer.render(scene, camera);
+  if (renderMeasurement) {
+    const presentedAt = performance.now();
+    renderMeasurement.firstAt ??= presentedAt;
+    renderMeasurement.lastAt = presentedAt;
+    renderMeasurement.count += 1;
+  }
+  if (pendingAlignedRequestId === requestIdCounter && activeLayoutResult?.requestId === pendingAlignedRequestId && validatedResultAt !== null) {
+    firstAlignedSceneLatencyMs = performance.now() - validatedResultAt;
+    pendingAlignedRequestId = null;
+  }
 }
 
-requestAnimationFrame(animate);
+function disposeApplication() {
+  if (applicationDisposed) return;
+  applicationDisposed = true;
+  if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+  disposeViewportGridListener();
+  layoutRunner.dispose();
+  if (activeLiveIslandHandle && activeLiveIslandHandle !== activeIslandHandle) activeLiveIslandHandle.dispose();
+  activeLiveIslandHandle = null;
+  activeIslandHandle?.dispose();
+  activeIslandHandle = null;
+  tiles = [];
+  controls.dispose();
+  particlesGeometry.dispose();
+  particles?.material.dispose();
+  particles?.removeFromParent();
+  renderer.dispose();
+  isBusy = false;
+}
+
+animationFrameId = requestAnimationFrame(animate);
