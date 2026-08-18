@@ -236,6 +236,11 @@ export function createLayoutRunner({
           return;
         }
         if (response.type === 'ready' || response.type === 'step') {
+          state.guardRemaining = hangGuardMs;
+          if (state.timer) {
+            clearTimer(state.timer);
+            state.timer = null;
+          }
           const previousEpoch = state.lastEpoch ?? -1;
           if (state.outstanding) {
             fail('PROTOCOL_ERROR', { reason: 'multiple-outstanding-frames' });

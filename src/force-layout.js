@@ -928,17 +928,18 @@ export function createForceLayoutSession(request) {
           session.state.unchangedAssignmentEpochs = 0;
         } else {
           session.state.unchangedAssignmentEpochs += 1;
-          if (session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs) {
-            session.assignmentFrozen = true;
-            session.targetForce.setStrength(session.config.hexStrength.stable);
-          }
+        }
+        if (session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs
+          || session.state.coolingStep >= session.config.maxCoolingSteps - 32) {
+          session.assignmentFrozen = true;
+          session.targetForce.setStrength(session.config.hexStrength.stable);
         }
       }
       if (session.assignmentFrozen && !isHeld) {
         const error = metricError(session.leafNodes, session.config, session.state.targetError);
         const lockEligible = error.max <= session.config.centerLockThresholds.maxCellSpacing
           && error.rms <= session.config.centerLockThresholds.rmsCellSpacing;
-        if (!session.automaticLock && session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs) {
+        if (!session.automaticLock && (session.state.unchangedAssignmentEpochs >= session.config.stableAssignmentEpochs || session.state.coolingStep >= session.config.maxCoolingSteps - 32)) {
           session.automaticLock = true;
           session.state.phase = 'center-locking';
           for (const leaf of session.leafNodes) {

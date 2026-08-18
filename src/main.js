@@ -787,6 +787,16 @@ async function rebuildIsland() {
   } catch (err) {
     candidateHandle?.dispose();
     candidateHandle = null;
+    if (activeLiveIslandHandle) {
+      if (!previousActiveHandle) {
+        activeIslandHandle = activeLiveIslandHandle;
+        activeLiveIslandHandle = null;
+        tiles = activeIslandHandle?.interactiveTiles ?? [];
+      } else {
+        activeLiveIslandHandle.dispose();
+        activeLiveIslandHandle = null;
+      }
+    }
     if (activeIslandHandle !== previousActiveHandle) {
       world.remove(activeIslandHandle.root);
       activeIslandHandle.dispose();
@@ -794,10 +804,7 @@ async function rebuildIsland() {
       tiles = previousActiveHandle?.interactiveTiles ?? [];
       waterRings = previousActiveHandle?.waterRings ?? [];
     }
-    activeLiveIslandHandle?.dispose();
-    activeLiveIslandHandle = null;
     if (previousActiveHandle && !world.children.includes(previousActiveHandle.root)) world.add(previousActiveHandle.root);
-    setForcePresentationMode(false);
     if (algorithmSelect.value === 'force-anchors') layoutRunner.cancelActiveLayout('render failure');
     console.error('rebuildIsland error:', err);
     if (currentRequestId !== requestIdCounter) return;
