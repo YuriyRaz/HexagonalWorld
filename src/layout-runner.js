@@ -1,5 +1,6 @@
 import { calculateLayout } from './layout.js';
 import { axialToPlane } from './hex.js';
+import { calculateAssignmentHash } from './force-layout.js';
 
 export function createLayoutRunner({
   workerFactory,
@@ -67,8 +68,18 @@ export function createLayoutRunner({
         topology: null,
         outstanding: null,
         terminalFrame: null,
-        terminalBuffer: null,
+        terminalPositionBuffer: null,
+        terminalCellBuffer: null,
         lastGlobalStep: null,
+        lastEpoch: null,
+        lastEpochStep: null,
+        lastAssignmentRevision: null,
+        lastAssignmentHash: null,
+        lastLeafCells: null,
+        lastTerminal: null,
+        committedEpoch: null,
+        hasSettlement: false,
+        presentation: options.presentation || 'all-steps',
         nextCommandSeq: 1,
         controlWaiters: new Map(),
         epochWaiters: new Map(),
@@ -187,19 +198,32 @@ export function createLayoutRunner({
           return;
         }
         if (state.destroyed || state.outstanding !== outstanding) return;
-        const expectedBuffer = outstanding.buffer;
-        const actual = receipt || { requestId: state.requestId, globalStep: frame.globalStep, buffer: expectedBuffer };
+        const expectedPositionBuffer = outstanding.positionBuffer;
+        const expectedCellBuffer = outstanding.cellBuffer;
+        const actual = receipt || {
+          requestId: state.requestId,
+          globalStep: frame.globalStep,
+          positionBuffer: expectedPositionBuffer,
+          cellBuffer: expectedCellBuffer,
+        };
         if (
           actual.requestId !== state.requestId
           || actual.globalStep !== frame.globalStep
-          || actual.buffer !== expectedBuffer
+          || actual.positionBuffer !== expectedPositionBuffer
+          || actual.cellBuffer !== expectedCellBuffer
         ) {
           fail('PROTOCOL_ERROR', { reason: 'invalid-presentation-receipt', globalStep: frame.globalStep });
           return;
         }
         state.outstanding = null;
         try {
-          worker.postMessage({ type: mode, requestId: state.requestId, globalStep: frame.globalStep, buffer: expectedBuffer }, [expectedBuffer]);
+          worker.postMessage({
+            type: mode,
+            requestId: state.requestId,
+            globalStep: frame.globalStep,
+            positionBuffer: expectedPositionBuffer,
+            cellBuffer: expectedCellBuffer,
+          }, [expectedPositionBuffer, expectedCellBuffer]);
         } catch {
           fail('WORKER_MESSAGE_FAILED');
         }
@@ -213,27 +237,27 @@ export function createLayoutRunner({
         }
         if (response.type === 'ready' || response.type === 'step') {
           const previousEpoch = state.lastEpoch ?? -1;
-          try {
-            if (response.type === 'ready') {
-              validateTopology(response.topology, state.requestId);
-              state.topology = response.topology;
-            }
-            validateFrame(response, state.topology, state.requestId);
-            const expectedStep = response.type === 'ready' ? 0 : (state.lastGlobalStep ?? -1) + 1;
-            if (response.globalStep !== expectedStep) throw new Error('non-contiguous global step');
-            state.lastGlobalStep = response.globalStep;
-            state.lastEpoch = response.epoch;
-          } catch {
-            fail('PROTOCOL_ERROR', { reason: 'invalid-frame' });
-            return;
-          }
           if (state.outstanding) {
             fail('PROTOCOL_ERROR', { reason: 'multiple-outstanding-frames' });
             return;
           }
+          try {
+            const topology = response.type === 'ready' ? response.topology : state.topology;
+            if (response.type === 'ready') {
+              validateTopology(response.topology, state.requestId);
+            }
+            validateFrame(response, topology, state.requestId);
+            validatePresentedFrameSequence(response, state, response.type);
+          } catch {
+            fail('PROTOCOL_ERROR', { reason: 'invalid-frame' });
+            return;
+          }
+          if (response.type === 'ready') state.topology = response.topology;
+          commitFrameSequence(state, response);
           state.outstanding = {
             globalStep: response.globalStep,
-            buffer: response.positions.buffer,
+            positionBuffer: response.positions.buffer,
+            cellBuffer: response.leafCells.buffer,
             frame: response,
             type: response.type,
             isEpochReady: response.epoch > 0 && response.epoch !== previousEpoch,
@@ -263,19 +287,24 @@ export function createLayoutRunner({
         if (response.type === 'success' || response.type === 'epoch-success') {
           try {
             if (!state.topology) validateTopology(response.topology, state.requestId);
-            state.topology ||= response.topology;
-            validateV2Result(state.request, response.result, response.terminalFrame, state.topology);
+            const topology = state.topology || response.topology;
+            validateV2Result(state.request, response.result, response.terminalFrame, topology);
+            validateSettlementSequence(response, state);
           } catch {
             fail('PROTOCOL_ERROR', { reason: 'invalid-settlement' });
             return;
           }
+          state.topology ||= response.topology;
+          if (state.presentation === 'final-only') commitFrameSequence(state, response.terminalFrame);
           if (state.timer) {
             clearTimer(state.timer);
             state.timer = null;
           }
           state.terminalFrame = response.terminalFrame;
-          state.terminalBuffer = response.terminalFrame?.positions?.buffer || null;
+          state.terminalPositionBuffer = response.terminalFrame?.positions?.buffer || null;
+          state.terminalCellBuffer = response.terminalFrame?.leafCells?.buffer || null;
           state.terminalEpoch = response.epoch ?? 0;
+          state.hasSettlement = true;
           state.phase = response.type === 'success' ? 'settled-awaiting-commit' : 'epoch-awaiting-commit';
           const settlement = Object.freeze({
             requestId: state.requestId,
@@ -318,7 +347,7 @@ export function createLayoutRunner({
       worker.addEventListener('error', onError);
       worker.addEventListener('messageerror', onMessageError);
       try {
-        worker.postMessage({ type: 'calculate', request, presentation: options.presentation || 'all-steps' });
+        worker.postMessage({ type: 'calculate', request, presentation: state.presentation });
       } catch {
         fail('WORKER_MESSAGE_FAILED');
       }
@@ -454,21 +483,30 @@ export function createLayoutRunner({
     if (state.phase !== 'settled-awaiting-commit' && state.phase !== 'epoch-awaiting-commit') {
       throw createRunnerError('INVALID_COMMIT', requestId, { phase: state.phase });
     }
-    if (!(state.terminalBuffer instanceof ArrayBuffer)) {
-      throw createRunnerError('INVALID_COMMIT', requestId, { reason: 'missing-terminal-buffer' });
+    if (!(state.terminalPositionBuffer instanceof ArrayBuffer) || !(state.terminalCellBuffer instanceof ArrayBuffer)) {
+      throw createRunnerError('INVALID_COMMIT', requestId, { reason: 'missing-terminal-buffers' });
     }
     if (epoch !== state.terminalEpoch) {
       throw createRunnerError('INVALID_COMMIT', requestId, { expectedEpoch: state.terminalEpoch, epoch });
     }
-    const terminalBuffer = state.terminalBuffer;
+    const terminalPositionBuffer = state.terminalPositionBuffer;
+    const terminalCellBuffer = state.terminalCellBuffer;
     try {
-      state.worker.postMessage({ type: 'session-result-committed', requestId, epoch, terminalBuffer }, [terminalBuffer]);
+      state.worker.postMessage({
+        type: 'session-result-committed',
+        requestId,
+        epoch,
+        terminalPositionBuffer,
+        terminalCellBuffer,
+      }, [terminalPositionBuffer, terminalCellBuffer]);
     } catch {
       const error = createRunnerError('WORKER_MESSAGE_FAILED', requestId, {});
       state.destroy(error);
       throw error;
     }
-    state.terminalBuffer = null;
+    state.terminalPositionBuffer = null;
+    state.terminalCellBuffer = null;
+    state.committedEpoch = epoch;
     state.phase = 'retained-settled';
   }
 
@@ -541,9 +579,15 @@ export function createLayoutRunner({
   function suppressActivePresentation() {
     const state = activeState;
     if (!state || state.kind !== 'v2' || !state.outstanding) return;
-    const { globalStep, buffer } = state.outstanding;
+    const { globalStep, positionBuffer, cellBuffer } = state.outstanding;
     state.outstanding = null;
-    state.worker.postMessage({ type: 'suppress', requestId: state.requestId, globalStep, buffer }, [buffer]);
+    state.worker.postMessage({
+      type: 'suppress',
+      requestId: state.requestId,
+      globalStep,
+      positionBuffer,
+      cellBuffer,
+    }, [positionBuffer, cellBuffer]);
   }
 
   function dispose() {
@@ -589,27 +633,152 @@ function validateTopology(topology, requestId) {
 }
 
 function validateFrame(frame, topology, requestId) {
-  if (!topology || frame.requestId !== requestId || !Number.isSafeInteger(frame.globalStep) || frame.globalStep < 0 || !Number.isSafeInteger(frame.epoch) || !Number.isSafeInteger(frame.coolingStep) || !(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2) throw new Error('invalid frame');
+  if (!topology || frame.requestId !== requestId || !Number.isSafeInteger(frame.globalStep) || frame.globalStep < 0
+    || !Number.isSafeInteger(frame.epoch) || frame.epoch < 0
+    || !Number.isSafeInteger(frame.epochStep) || frame.epochStep < 0
+    || !Number.isSafeInteger(frame.coolingStep) || frame.coolingStep < 0
+    || !(frame.positions instanceof Float32Array) || frame.positions.length !== topology.nodeIds.length * 2) throw new Error('invalid frame');
   for (const position of frame.positions) if (!Number.isFinite(position)) throw new Error('non-finite frame');
-  for (const value of [frame.assignmentRevision, frame.assignmentHash, frame.stableStreak, frame.maxMovement, frame.rmsMovement, frame.maxTargetError, frame.rmsTargetError]) {
+  if (!Number.isSafeInteger(frame.assignmentRevision) || frame.assignmentRevision < 0
+    || !Number.isSafeInteger(frame.assignmentHash) || frame.assignmentHash < 0 || frame.assignmentHash > 0xffffffff) {
+    throw new Error('invalid assignment identity');
+  }
+  for (const value of [frame.stableStreak, frame.maxMovement, frame.rmsMovement, frame.maxTargetError, frame.rmsTargetError]) {
     if (!Number.isFinite(value)) throw new Error('invalid frame diagnostic');
   }
   if (!['none', 'converged', 'not-converged'].includes(frame.terminal)) throw new Error('invalid terminal');
+  if (!(frame.leafCells instanceof Int16Array)) throw new Error('invalid leafCells type');
+  const leafIds = topology.nodeIds.filter((_, index) => topology.nodeKinds[index] === 'leaf');
+  if (frame.leafCells.length !== leafIds.length * 2) throw new Error('invalid leafCells length');
+  const cellSet = new Set();
+  for (let index = 0; index < frame.leafCells.length; index += 2) {
+    const q = frame.leafCells[index];
+    const r = frame.leafCells[index + 1];
+    const radius = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
+    if (radius > 256) throw new Error('out of bounds leafCell');
+    const key = `${q},${r}`;
+    if (cellSet.has(key)) throw new Error('duplicate leafCell');
+    cellSet.add(key);
+  }
+  if (calculateAssignmentHash(leafIds, frame.leafCells) !== frame.assignmentHash) throw new Error('assignment hash mismatch');
+}
+
+function equalLeafCells(left, right) {
+  if (!(left instanceof Int16Array) || left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function validateAssignmentSequence(frame, state, allowSuppressedGaps = false) {
+  if (state.lastAssignmentRevision === null) return;
+  if (frame.assignmentRevision < state.lastAssignmentRevision) throw new Error('assignment revision regression');
+  const revisionDelta = frame.assignmentRevision - state.lastAssignmentRevision;
+  if (!allowSuppressedGaps && revisionDelta > 1) throw new Error('assignment revision jump');
+  const cellsChanged = !equalLeafCells(frame.leafCells, state.lastLeafCells);
+  if (revisionDelta === 0 && (frame.assignmentHash !== state.lastAssignmentHash || cellsChanged)) {
+    throw new Error('assignment changed without revision');
+  }
+  if (revisionDelta === 1 && !cellsChanged) throw new Error('assignment revision changed without cells');
+}
+
+function validatePresentedFrameSequence(frame, state, type) {
+  if (type === 'ready') {
+    if (state.lastGlobalStep !== null || frame.globalStep !== 0 || frame.epoch !== 0 || frame.epochStep !== 0
+      || frame.assignmentRevision !== 0) throw new Error('invalid ready sequence');
+    return;
+  }
+  if (state.lastGlobalStep === null) throw new Error('step without active sequence');
+  if (frame.globalStep !== state.lastGlobalStep + 1) throw new Error('non-contiguous global step');
+  if (frame.epoch < state.lastEpoch || frame.epoch > state.lastEpoch + 1) throw new Error('invalid epoch sequence');
+  const retainedTransition = frame.epoch === state.lastEpoch + 1;
+  if (retainedTransition
+    && (state.phase !== 'retained-settled' || state.committedEpoch !== state.lastEpoch || frame.epochStep !== 1)) {
+    throw new Error('invalid retained epoch transition');
+  }
+  if (state.lastTerminal !== 'none' && !retainedTransition) throw new Error('step after terminal frame');
+  validateAssignmentSequence(frame, state);
+}
+
+function validateSettlementSequence(response, state) {
+  const frame = response.terminalFrame;
+  if (!Number.isSafeInteger(response.epoch) || response.epoch < 0
+    || !Number.isSafeInteger(response.globalStep) || response.globalStep < 0
+    || response.epoch !== frame.epoch || response.globalStep !== frame.globalStep) {
+    throw new Error('settlement identity mismatch');
+  }
+  if (response.type === 'success') {
+    if (state.hasSettlement || response.epoch !== 0) throw new Error('invalid initial settlement');
+  } else if (!state.hasSettlement || response.epoch !== state.terminalEpoch + 1) {
+    throw new Error('invalid epoch settlement');
+  }
+
+  if (state.presentation === 'all-steps') {
+    if (state.lastGlobalStep === null || state.lastTerminal !== 'converged'
+      || frame.globalStep !== state.lastGlobalStep || frame.epoch !== state.lastEpoch
+      || frame.epochStep !== state.lastEpochStep || frame.assignmentRevision !== state.lastAssignmentRevision
+      || frame.assignmentHash !== state.lastAssignmentHash || !equalLeafCells(frame.leafCells, state.lastLeafCells)) {
+      throw new Error('settlement does not match presented terminal frame');
+    }
+    return;
+  }
+
+  if (response.type === 'success') {
+    if (state.lastGlobalStep !== null) throw new Error('duplicate initial settlement');
+    return;
+  }
+  if (state.committedEpoch !== state.lastEpoch || frame.globalStep <= state.lastGlobalStep) {
+    throw new Error('invalid retained final-only settlement');
+  }
+  validateAssignmentSequence(frame, state, true);
+}
+
+function commitFrameSequence(state, frame) {
+  if (!state.lastLeafCells) state.lastLeafCells = new Int16Array(frame.leafCells.length);
+  if (state.lastAssignmentRevision !== frame.assignmentRevision || state.lastAssignmentRevision === null) {
+    state.lastLeafCells.set(frame.leafCells);
+  }
+  state.lastGlobalStep = frame.globalStep;
+  state.lastEpoch = frame.epoch;
+  state.lastEpochStep = frame.epochStep;
+  state.lastAssignmentRevision = frame.assignmentRevision;
+  state.lastAssignmentHash = frame.assignmentHash;
+  state.lastTerminal = frame.terminal;
 }
 
 function validateV2Result(request, result, terminalFrame, topology) {
   if (!result || result.requestId !== request.requestId || result.mode !== request.mode || !Array.isArray(result.placements) || !Array.isArray(result.springs) || !Number.isSafeInteger(result.gridRadius) || result.gridRadius < 0 || result.gridRadius > 256) throw new Error('invalid result');
   const leafIds = topology.nodeIds.filter((_, index) => topology.nodeKinds[index] === 'leaf');
+  validateFrame(terminalFrame, topology, request.requestId);
+  if (terminalFrame.terminal !== 'converged') throw new Error('missing terminal frame');
   if (result.placements.length !== leafIds.length || result.stats?.occupiedCount !== leafIds.length) throw new Error('invalid placements');
   const cells = new Set();
   for (let index = 0; index < result.placements.length; index += 1) {
     const placement = result.placements[index];
-    if (placement.entityId !== leafIds[index] || !Number.isSafeInteger(placement.q) || !Number.isSafeInteger(placement.r)) throw new Error('invalid placement');
+    if (placement.entityId !== leafIds[index] || !Number.isSafeInteger(placement.q) || !Number.isSafeInteger(placement.r)
+      || Math.max(Math.abs(placement.q), Math.abs(placement.r), Math.abs(-placement.q - placement.r)) > 256) throw new Error('invalid placement');
     const key = `${placement.q},${placement.r}`;
     if (cells.has(key)) throw new Error('duplicate placement');
     cells.add(key);
+    if (terminalFrame.leafCells[index * 2] !== placement.q || terminalFrame.leafCells[index * 2 + 1] !== placement.r) {
+      throw new Error('terminal cell mismatch');
+    }
   }
   if (result.springs.length !== topology.relations.length) throw new Error('invalid spring count');
+  if (!result.leafCells || typeof result.leafCells !== 'object') throw new Error('invalid leafCells');
+  if (!result.towerPositions || typeof result.towerPositions !== 'object') throw new Error('invalid towerPositions');
+  for (const leafId of leafIds) {
+    if (!(leafId in result.leafCells)) throw new Error('missing leafCell');
+    const cell = result.leafCells[leafId];
+    if (!Number.isSafeInteger(cell.q) || !Number.isSafeInteger(cell.r)) throw new Error('invalid leafCell coordinates');
+    const placement = result.placements[leafIds.indexOf(leafId)];
+    if (cell.q !== placement.q || cell.r !== placement.r) throw new Error('result leafCell mismatch');
+    if (!(leafId in result.towerPositions)) throw new Error('missing towerPosition');
+    const pos = result.towerPositions[leafId];
+    const center = axialToPlane(cell.q, cell.r);
+    if (pos.x !== center.x || pos.z !== center.z) throw new Error('invalid towerPosition coordinates');
+  }
   for (let index = 0; index < result.springs.length; index += 1) {
     const spring = result.springs[index];
     const relation = topology.relations[index];
@@ -617,14 +786,10 @@ function validateV2Result(request, result, terminalFrame, topology) {
     if (!Number.isFinite(spring.source.q) || !Number.isFinite(spring.source.r) || !Number.isFinite(spring.target.q) || !Number.isFinite(spring.target.r)) throw new Error('invalid spring coordinates');
   }
   const diagnostics = result.diagnostics;
-  if (!diagnostics || diagnostics.version !== 2 || !Number.isFinite(diagnostics.globalStep) || !Number.isFinite(diagnostics.assignmentHash)) throw new Error('invalid diagnostics');
-  if (!terminalFrame || terminalFrame.terminal !== 'converged' || terminalFrame.result !== result) {
-    // Structured clone does not preserve object identity between the two
-    // message fields, so the result identity check is intentionally shallow.
-    if (!terminalFrame || terminalFrame.terminal !== 'converged') throw new Error('missing terminal frame');
-  }
+  if (!diagnostics || diagnostics.version !== 2 || diagnostics.globalStep !== terminalFrame.globalStep
+    || diagnostics.epoch !== terminalFrame.epoch || diagnostics.assignmentRevision !== terminalFrame.assignmentRevision
+    || diagnostics.assignmentHash !== terminalFrame.assignmentHash) throw new Error('invalid diagnostics');
   if (JSON.stringify(terminalFrame.result) !== JSON.stringify(result)) throw new Error('terminal result mismatch');
-  if (terminalFrame.positions.length !== topology.nodeIds.length * 2) throw new Error('invalid terminal positions');
   for (let index = 0; index < leafIds.length; index += 1) {
     const nodeIndex = topology.nodeIds.indexOf(leafIds[index]);
     const placement = result.placements[index];
