@@ -3,6 +3,7 @@ import {
   forceLink,
   forceManyBody,
   forceCenter,
+  forceCollide,
 } from 'd3-force';
 import { normalizeHierarchy, HierarchyError } from './data.js';
 import {
@@ -76,6 +77,8 @@ export const FORCE_LAYOUT_CONFIG_V2 = deepFreeze({
   linkDistance: 2,
   linkStrength: 0.2,
   linkIterations: 1,
+  collideStrength: 1.0,
+  collideRadiusMultiplier: 1.0,
 });
 
 export const FORCE_LAYOUT_VERSION_2_CONFIG = FORCE_LAYOUT_CONFIG_V2;
@@ -241,6 +244,19 @@ function createHexTargetForce(config, leafNodes) {
   return force;
 }
 
+export function calculateAssignmentHash(leafIds, leafCells) {
+  let hash = 2166136261;
+  for (let index = 0; index < leafIds.length; index += 1) {
+    hash ^= leafIds[index].length;
+    hash = Math.imul(hash, 16777619);
+    hash ^= leafCells[index * 2];
+    hash = Math.imul(hash, 16777619);
+    hash ^= leafCells[index * 2 + 1];
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
 function assignmentHash(leafNodes) {
   let hash = 2166136261;
   for (const node of leafNodes) {
@@ -375,9 +391,10 @@ function resolveAssignments(leafNodes, config, candidateOffsets, storage) {
       const challengerCost = costs[flatIndex];
       const challengerOwned = previousQ[leafIndex] === q && previousR[leafIndex] === r;
       const incumbentOwned = previousQ[incumbent] === q && previousR[incumbent] === r;
-      challengerWins = challengerCost < incumbentCost
-        || (challengerCost === incumbentCost && challengerOwned !== incumbentOwned && challengerOwned)
-        || (challengerCost === incumbentCost && challengerOwned === incumbentOwned && leafIndex < incumbent);
+      challengerWins = challengerOwned !== incumbentOwned
+        ? challengerOwned
+        : challengerCost < incumbentCost
+          || (challengerCost === incumbentCost && leafIndex < incumbent);
     }
     if (challengerWins) {
       holderByCell[cellIndex] = leafIndex;
@@ -474,6 +491,13 @@ function createV2Result(session) {
     (radius, placement) => Math.max(radius, axialDistance(placement)),
     0,
   );
+  const leafCells = {};
+  const towerPositions = {};
+  for (const placement of placements) {
+    leafCells[placement.entityId] = { q: placement.q, r: placement.r };
+    const center = axialToPlane(placement.q, placement.r);
+    towerPositions[placement.entityId] = { x: center.x, z: center.z };
+  }
   const diagnostics = {
     kind: 'force',
     version: 2,
@@ -500,6 +524,8 @@ function createV2Result(session) {
     requestId,
     mode: request.mode,
     placements,
+    leafCells,
+    towerPositions,
     springs,
     gridRadius,
     stats: { occupiedCount: placements.length, boundaryGaps: [] },
@@ -509,10 +535,19 @@ function createV2Result(session) {
 
 function makeFrame(session, terminal = 'none', result = null) {
   const { requestId, nodes, state } = session;
-  const positions = new Float32Array(nodes.length * 2);
+  const { positions, leafCells: leafCellsArray } = session.frameBuffers;
+  if (positions.buffer.byteLength === 0 || leafCellsArray.buffer.byteLength === 0) {
+    throw new ForceLayoutError('FRAME_BUFFERS_UNAVAILABLE', { requestId });
+  }
+
   for (const node of nodes) {
     positions[node.index * 2] = Math.fround(node.x);
     positions[node.index * 2 + 1] = Math.fround(node.y);
+  }
+  for (let i = 0; i < session.leafNodes.length; i += 1) {
+    const node = session.leafNodes[i];
+    leafCellsArray[i * 2] = node.assignedQ;
+    leafCellsArray[i * 2 + 1] = node.assignedR;
   }
   return {
     requestId,
@@ -530,6 +565,7 @@ function makeFrame(session, terminal = 'none', result = null) {
     maxTargetError: state.targetError.max,
     rmsTargetError: state.targetError.rms,
     appliedCommandSeq: state.acceptedCommandSeq,
+    leafCells: leafCellsArray,
     terminal,
     result,
   };
@@ -628,6 +664,11 @@ export function createForceLayoutSession(request) {
       target: relation.targetIndex,
     }));
     const targetForce = createHexTargetForce(request.config, leafNodes);
+    const collideRadius = ADJACENT_CELL_SPACING * 0.5 * request.config.collideRadiusMultiplier;
+    const collisionForce = forceCollide()
+      .radius((node) => node.kind === 'leaf' ? collideRadius : 0)
+      .strength(request.config.collideStrength)
+      .iterations(1);
     const simulation = forceSimulation(nodes)
       .randomSource(mulberry32(request.config.seed))
       .force('link', forceLink(links)
@@ -642,6 +683,7 @@ export function createForceLayoutSession(request) {
         .distanceMax(request.config.manyBodyDistanceMax))
       .force('center', forceCenter(0, 0).strength(request.config.centerStrength))
       .force('hex', targetForce)
+      .force('collide', collisionForce)
       .velocityDecay(request.config.velocityDecay)
       .alphaDecay(0)
       .alphaMin(0)
@@ -657,7 +699,7 @@ export function createForceLayoutSession(request) {
       costs: new Float64Array(leafCount * candidateCapacity),
       candidateCounts: new Uint8Array(leafCount),
       nextCandidate: new Uint8Array(leafCount),
-      queue: new Int32Array(leafCount * candidateCapacity),
+      queue: new Int32Array(leafCount * (candidateCapacity + 1)),
       holderByCell: new Int32Array((request.config.maxGridRadius * 2 + 1) ** 2),
       previousQ: new Int32Array(leafCount),
       previousR: new Int32Array(leafCount),
@@ -703,6 +745,10 @@ export function createForceLayoutSession(request) {
         terminationReason: null,
       },
       previousPositions,
+      frameBuffers: {
+        positions: new Float32Array(nodes.length * 2),
+        leafCells: new Int16Array(leafNodes.length * 2),
+      },
       automaticLock: false,
       assignmentFrozen: false,
       commandQueue: [],
@@ -718,6 +764,16 @@ export function createForceLayoutSession(request) {
     for (const node of leafNodes) node.index = nodes.indexOf(node);
 
     session.initialFrame = () => makeFrame(session);
+    session.reclaimFrameBuffers = (positionBuffer, cellBuffer) => {
+      const expectedPositionBytes = nodes.length * 2 * Float32Array.BYTES_PER_ELEMENT;
+      const expectedCellBytes = leafNodes.length * 2 * Int16Array.BYTES_PER_ELEMENT;
+      if (!(positionBuffer instanceof ArrayBuffer) || positionBuffer.byteLength !== expectedPositionBytes
+        || !(cellBuffer instanceof ArrayBuffer) || cellBuffer.byteLength !== expectedCellBytes) {
+        throw new ForceLayoutError('INVALID_FRAME_RECEIPT', { requestId: session.requestId });
+      }
+      session.frameBuffers.positions = new Float32Array(positionBuffer);
+      session.frameBuffers.leafCells = new Int16Array(cellBuffer);
+    };
     session.topology = () => structuredClone(topology);
     session.isSettled = () => session.state.phase === 'settled';
     session.trace = () => session.traceEntries.map((entry) => structuredClone(entry));
