@@ -112,4 +112,96 @@ describe('version-2 retained force session', () => {
     assert.equal(first.diagnostics.converged, true);
     assert.equal(first.diagnostics.terminationReason, 'CONVERGED');
   });
+
+  test('frame includes leafCells Int16Array mapping canonical leaf order to axial coordinates', () => {
+    const session = createForceLayoutSession(request());
+    let frame = session.initialFrame();
+    while (frame.terminal === 'none') frame = session.advanceOneStep();
+    assert.ok(frame.leafCells, 'frame must have leafCells');
+    assert.ok(frame.leafCells instanceof Int16Array, 'leafCells must be Int16Array');
+    session.dispose();
+  });
+
+  test('derives tower centers from the canonical typed assignment snapshot', () => {
+    const session = createForceLayoutSession(request());
+    let frame = session.initialFrame();
+    while (frame.terminal === 'none') frame = session.advanceOneStep();
+    const center = axialToPlane(frame.leafCells[0], frame.leafCells[1]);
+    assert.equal(frame.positions[2 * 2], Math.fround(center.x));
+    assert.equal(frame.positions[2 * 2 + 1], Math.fround(center.z));
+    session.dispose();
+  });
+
+  test('settled result includes leafCells and towerPositions', () => {
+    const result = calculateForceLayout(request());
+    assert.ok(result.leafCells, 'result must have leafCells');
+    assert.ok(result.towerPositions, 'result must have towerPositions');
+    assert.ok('leaf-a' in result.leafCells);
+    assert.ok('leaf-z' in result.leafCells);
+    assert.ok('leaf-a' in result.towerPositions);
+    assert.ok('leaf-z' in result.towerPositions);
+    const cells = Object.values(result.leafCells);
+    const cellSet = new Set(cells.map(c => `${c.q},${c.r}`));
+    assert.equal(cellSet.size, cells.length, 'no duplicate cells in leafCells');
+  });
+
+  test('empty topology rejects with EMPTY_HIERARCHY', () => {
+    assert.throws(
+      () => calculateForceLayout({ ...request({ entities: [] }) }),
+      (error) => error instanceof ForceLayoutError && error.code === 'EMPTY_HIERARCHY',
+    );
+  });
+
+  test('validates Int16Array leafCells snapshot, inclusive radius <= 256, uniqueness, and hash predicate', () => {
+    const session = createForceLayoutSession(request({ traceEnabled: true }));
+    const frame = session.initialFrame();
+
+    assert.ok(frame.leafCells instanceof Int16Array, 'leafCells must be Int16Array');
+    assert.equal(frame.leafCells.length, 4, 'leafCells length must be 2 * leafCount (2 leaves * 2 = 4)');
+
+    // Verify leafCells contains whole-number axial coordinates R(q,r) <= 256
+    const cellKeys = new Set();
+    for (let i = 0; i < frame.leafCells.length; i += 2) {
+      const q = frame.leafCells[i];
+      const r = frame.leafCells[i + 1];
+      assert.equal(Number.isInteger(q), true);
+      assert.equal(Number.isInteger(r), true);
+      const radius = Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r));
+      assert.ok(radius <= 256, `R(${q},${r}) = ${radius} must be <= 256`);
+      const key = `${q},${r}`;
+      assert.ok(!cellKeys.has(key), `duplicate cell assignment ${key}`);
+      cellKeys.add(key);
+    }
+
+    assert.equal(typeof frame.assignmentHash, 'number');
+    assert.equal(Number.isInteger(frame.assignmentHash), true);
+
+    const terminal = settle(session);
+    assert.ok(terminal.leafCells instanceof Int16Array);
+    const result = session.serializeSettledResult();
+    assert.equal(result.placements.length, 2);
+    for (let i = 0; i < result.placements.length; i += 1) {
+      const p = result.placements[i];
+      assert.equal(p.q, terminal.leafCells[i * 2]);
+      assert.equal(p.r, terminal.leafCells[i * 2 + 1]);
+    }
+    session.dispose();
+  });
+
+  test('reclaims both transferred frame buffers before producing the next frame', () => {
+    const session = createForceLayoutSession(request());
+    for (let step = 0; step < 8; step += 1) {
+      const frame = step === 0 ? session.initialFrame() : session.advanceOneStep();
+      const transferred = structuredClone({
+        positionBuffer: frame.positions.buffer,
+        cellBuffer: frame.leafCells.buffer,
+      }, { transfer: [frame.positions.buffer, frame.leafCells.buffer] });
+      assert.equal(frame.positions.byteLength, 0);
+      assert.equal(frame.leafCells.byteLength, 0);
+      session.reclaimFrameBuffers(transferred.positionBuffer, transferred.cellBuffer);
+      assert.equal(session.frameBuffers.positions.length, session.nodes.length * 2);
+      assert.equal(session.frameBuffers.leafCells.length, session.leafNodes.length * 2);
+    }
+    session.dispose();
+  });
 });

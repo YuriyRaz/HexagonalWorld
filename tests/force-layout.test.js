@@ -10,9 +10,10 @@ import {
   createForceLayoutSession,
   mulberry32,
 } from '../src/force-layout.js';
-import { axialToPlane, quantize } from '../src/hex.js';
+import { axialToPlane, quantize, ADJACENT_CELL_SPACING } from '../src/hex.js';
 import {
   buildCycleHierarchy,
+  buildAlignmentBenchmarkHierarchy,
   buildDepthSeventeenHierarchy,
   buildGroupingHierarchy,
   buildSingleRootLeafHierarchy,
@@ -77,9 +78,42 @@ describe('version-2 public calculation', () => {
     Object.freeze(input);
 
     const first = calculateForceLayout(input);
-    const second = calculateForceLayout(request());
+    const second = calculateForceLayout(input);
     assert.deepEqual(input, expected);
-    assert.deepEqual(second, first);
+    assert.deepEqual(first, second);
+  });
+
+  test('[US1] 20-run deterministic repeat assertions across complete ordered visible frame sequence', () => {
+    const req = request(buildGroupingHierarchy());
+    const runSequence = () => {
+      const session = createForceLayoutSession({ ...req, traceEnabled: true });
+      const frames = [];
+      let frame = session.initialFrame();
+      const snapshot = (current) => ({
+        step: current.globalStep,
+        rev: current.assignmentRevision,
+        hash: current.assignmentHash,
+        cells: Array.from(current.leafCells),
+        centers: Array.from({ length: current.leafCells.length / 2 }, (_, index) => {
+          const center = axialToPlane(current.leafCells[index * 2], current.leafCells[index * 2 + 1]);
+          return [Math.fround(center.x), Math.fround(center.z)];
+        }),
+      });
+      frames.push(snapshot(frame));
+      while (frame.terminal === 'none') {
+        frame = session.advanceOneStep();
+        frames.push(snapshot(frame));
+      }
+      session.dispose();
+      return frames;
+    };
+
+    const firstRun = runSequence();
+    assert.ok(firstRun.length > 5);
+    for (let i = 0; i < 20; i++) {
+      const currentRun = runSequence();
+      assert.deepEqual(currentRun, firstRun, `Run ${i} must match baseline sequence exactly`);
+    }
   });
 
   test('rejects cycles and unsupported link scale through typed boundaries', () => {
@@ -165,6 +199,43 @@ describe('exact quantization and canonical control radius', () => {
   });
 });
 
+describe('collision force overlap prevention', () => {
+  test('collision config properties are present with correct defaults', () => {
+    assert.equal(FORCE_LAYOUT_CONFIG_V2.collideStrength, 1.0);
+    assert.equal(FORCE_LAYOUT_CONFIG_V2.collideRadiusMultiplier, 1.0);
+  });
+
+  test('leaf node distances satisfy minimum distance constraint across all simulation steps', () => {
+    const session = createForceLayoutSession(request());
+    const tolerance = 0.99;
+    const minimumDistance = ADJACENT_CELL_SPACING * FORCE_LAYOUT_CONFIG_V2.collideRadiusMultiplier * tolerance;
+    let frame = session.initialFrame();
+    let violationFound = false;
+
+    while (frame.terminal === 'none') {
+      const positions = frame.positions;
+      const leafNodes = session.leafNodes;
+      for (let i = 0; i < leafNodes.length; i += 1) {
+        for (let j = i + 1; j < leafNodes.length; j += 1) {
+          const xi = positions[leafNodes[i].index * 2];
+          const yi = positions[leafNodes[i].index * 2 + 1];
+          const xj = positions[leafNodes[j].index * 2];
+          const yj = positions[leafNodes[j].index * 2 + 1];
+          const distance = Math.hypot(xi - xj, yi - yj);
+          if (distance < minimumDistance) {
+            violationFound = true;
+          }
+        }
+      }
+      if (violationFound) break;
+      frame = session.advanceOneStep();
+    }
+
+    assert.equal(violationFound, false, `Leaf nodes violated minimum distance of ${minimumDistance}`);
+    session.dispose();
+  });
+});
+
 describe('bounded deferred acceptance and reusable storage', () => {
   test('ranks reusable candidates by quantized cost, q, r and preserves unique ownership', () => {
     const session = createForceLayoutSession(request(buildGroupingHierarchy()));
@@ -213,6 +284,17 @@ describe('bounded deferred acceptance and reusable storage', () => {
     assert.strictEqual(session.state.movement, movement);
     assert.strictEqual(session.previousPositions, previousPositions);
     assert.strictEqual(session.assignmentStorage.candidateQ, candidateQ);
+    session.dispose();
+  });
+
+  test('preserves 500 unique assignments when the deferred-acceptance queue is saturated', () => {
+    const session = createForceLayoutSession(request(buildAlignmentBenchmarkHierarchy()));
+    for (let step = 0; step < 8; step += 1) {
+      const frame = step === 0 ? session.initialFrame() : session.advanceOneStep();
+      const cells = new Set();
+      for (let index = 0; index < frame.leafCells.length; index += 2) cells.add(`${frame.leafCells[index]},${frame.leafCells[index + 1]}`);
+      assert.equal(cells.size, 500);
+    }
     session.dispose();
   });
 });

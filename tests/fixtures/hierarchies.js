@@ -613,3 +613,260 @@ export function assertHierarchyCounts(entities, expected) {
   }
   return actual;
 }
+
+// ============================================================
+// Canonical Fixtures for T001 (007-fix-tower-cell-alignment)
+// ============================================================
+
+export const empty = Object.freeze({
+  description: 'Empty topology with no entities',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 0,
+  leaves: 0,
+  radius: 0,
+  topology: [],
+  expected: {
+    leafCells: {},
+    towerPositions: {},
+  },
+});
+
+export const singleLeaf = Object.freeze({
+  description: 'Single anchor with one leaf child',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 1,
+  radius: 0,
+  topology: [
+    { id: 'root-1', type: 'anchor', axial: { q: 0, r: 0 }, label: 'Root', children: ['leaf-1'] },
+    { id: 'leaf-1', type: 'leaf', axial: { q: 0, r: 0 }, label: 'Leaf 1', children: [] },
+  ],
+  expected: {
+    leafCells: { 'leaf-1': { q: 0, r: 0 } },
+    towerPositions: { 'leaf-1': { x: 0, z: 0 } },
+  },
+});
+
+export const conflictingCells = Object.freeze({
+  description: 'Three leaves that could map to the same cell, requiring tiebreak',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 3,
+  radius: 1,
+  topology: [
+    { id: 'root-cf', type: 'anchor', axial: { q: 0, r: 0 }, label: 'Root', children: ['leaf-a', 'leaf-b', 'leaf-c'] },
+    { id: 'leaf-a', type: 'leaf', axial: { q: 0, r: 0 }, label: 'Leaf A', children: [] },
+    { id: 'leaf-b', type: 'leaf', axial: { q: 0, r: 0 }, label: 'Leaf B', children: [] },
+    { id: 'leaf-c', type: 'leaf', axial: { q: 1, r: 0 }, label: 'Leaf C', children: [] },
+  ],
+  expected: {
+    leafCells: {
+      'leaf-a': { q: 0, r: 0 },
+      'leaf-b': { q: 1, r: -1 },
+      'leaf-c': { q: 1, r: 0 },
+    },
+    towerPositions: {
+      'leaf-a': { x: 0, z: 0 },
+      'leaf-b': { x: 1.5, z: -Math.sqrt(3) / 2 },
+      'leaf-c': { x: 1.5, z: Math.sqrt(3) / 2 },
+    },
+  },
+});
+
+export const negativeCoordinates = Object.freeze({
+  description: 'Leaves at negative axial positions',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 3,
+  radius: 2,
+  topology: [
+    { id: 'root-neg', type: 'anchor', axial: { q: -2, r: 1 }, label: 'Root', children: ['neg-1', 'neg-2', 'neg-3'] },
+    { id: 'neg-1', type: 'leaf', axial: { q: -2, r: 1 }, label: 'Neg 1', children: [] },
+    { id: 'neg-2', type: 'leaf', axial: { q: -1, r: 2 }, label: 'Neg 2', children: [] },
+    { id: 'neg-3', type: 'leaf', axial: { q: 0, r: 1 }, label: 'Neg 3', children: [] },
+  ],
+  expected: {
+    leafCells: {
+      'neg-1': { q: -2, r: 1 },
+      'neg-2': { q: -1, r: 2 },
+      'neg-3': { q: 0, r: 1 },
+    },
+    towerPositions: {
+      'neg-1': {},
+      'neg-2': {},
+      'neg-3': {},
+    },
+  },
+});
+
+export const maxRadius = Object.freeze({
+  description: 'Entity at exactly R=256 boundary',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 1,
+  radius: 256,
+  topology: [
+    { id: 'root-max', type: 'anchor', axial: { q: 256, r: 0 }, label: 'Root', children: ['boundary-leaf'] },
+    { id: 'boundary-leaf', type: 'leaf', axial: { q: 256, r: 0 }, label: 'Boundary Leaf', children: [] },
+  ],
+  expected: {
+    leafCells: { 'boundary-leaf': { q: 256, r: 0 } },
+    towerPositions: { 'boundary-leaf': {} },
+  },
+});
+
+export const overflowRadius = Object.freeze({
+  description: 'Entity at R=257 exceeds max grid radius',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 1,
+  radius: 257,
+  topology: [
+    { id: 'root-ovf', type: 'anchor', axial: { q: 257, r: 0 }, label: 'Root', children: ['overflow-leaf'] },
+    { id: 'overflow-leaf', type: 'leaf', axial: { q: 257, r: 0 }, label: 'Overflow Leaf', children: [] },
+  ],
+  expected: {
+    leafCells: { 'overflow-leaf': { q: 256, r: 0 } },
+    towerPositions: { 'overflow-leaf': {} },
+  },
+});
+
+export const nonNumericCoordinates = Object.freeze({
+  description: 'Entity with NaN and non-integer coordinates',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 2,
+  radius: 0,
+  topology: [
+    { id: 'root-nan', type: 'anchor', axial: { q: 0, r: 0 }, label: 'Root', children: ['valid-leaf', 'nan-leaf'] },
+    { id: 'valid-leaf', type: 'leaf', axial: { q: 0, r: 0 }, label: 'Valid Leaf', children: [] },
+    { id: 'nan-leaf', type: 'leaf', axial: { q: NaN, r: 1.5 }, label: 'NaN Leaf', children: [] },
+  ],
+  expected: {
+    leafCells: {
+      'valid-leaf': { q: 0, r: 0 },
+      'nan-leaf': { q: 0, r: 2 },
+    },
+    towerPositions: {
+      'valid-leaf': { x: 0, z: 0 },
+      'nan-leaf': {},
+    },
+  },
+});
+
+export const repeatability = Object.freeze({
+  description: 'Identical inputs must produce identical outputs across runs',
+  layout: 'force-anchors',
+  depth: 'shallow',
+  anchors: 1,
+  leaves: 2,
+  radius: 1,
+  topology: [
+    { id: 'root-rep', type: 'anchor', axial: { q: 0, r: 0 }, label: 'Root', children: ['rep-1', 'rep-2'] },
+    { id: 'rep-1', type: 'leaf', axial: { q: 0, r: 0 }, label: 'Repeat 1', children: [] },
+    { id: 'rep-2', type: 'leaf', axial: { q: 1, r: 0 }, label: 'Repeat 2', children: [] },
+  ],
+  expected: {
+    leafCells: {
+      'rep-1': { q: 0, r: 0 },
+      'rep-2': { q: 1, r: 0 },
+    },
+    towerPositions: {
+      'rep-1': { x: 0, z: 0 },
+      'rep-2': { x: 1.5, z: Math.sqrt(3) / 2 },
+    },
+  },
+});
+
+// Generate a large hierarchy with ~500 towers for performance testing
+function generateLargeHierarchy() {
+  const topology = [];
+  const leafCount = 500;
+  const anchorCount = 20;
+
+  // Create anchor tree
+  topology.push({ id: 'large-root', type: 'anchor', axial: { q: 0, r: 0 }, label: 'Large Root', children: [] });
+
+  for (let i = 1; i < anchorCount; i++) {
+    const parentIdx = Math.floor((i - 1) / 3);
+    const parentId = parentIdx === 0 ? 'large-root' : `large-anchor-${parentIdx}`;
+    topology.push({
+      id: `large-anchor-${i}`,
+      type: 'anchor',
+      axial: { q: (i % 11) - 5, r: Math.floor(i / 11) - 2 },
+      label: `Anchor ${i}`,
+      children: [],
+    });
+    topology.find(n => n.id === parentId).children.push(`large-anchor-${i}`);
+  }
+
+  const cells = [];
+  for (let radius = 0; cells.length < leafCount; radius += 1) {
+    for (let q = -radius; q <= radius && cells.length < leafCount; q += 1) {
+      const minR = Math.max(-radius, -q - radius);
+      const maxR = Math.min(radius, -q + radius);
+      for (let r = minR; r <= maxR && cells.length < leafCount; r += 1) {
+        if (Math.max(Math.abs(q), Math.abs(r), Math.abs(-q - r)) === radius) cells.push({ q, r });
+      }
+    }
+  }
+
+  // Canonical unique ring order keeps the representative fixture valid.
+  for (let i = 0; i < leafCount; i++) {
+    const { q, r } = cells[i];
+    const parentIdx = i % anchorCount;
+    const parentId = parentIdx === 0 ? 'large-root' : `large-anchor-${parentIdx}`;
+
+    topology.push({
+      id: `large-leaf-${i}`,
+      type: 'leaf',
+      axial: { q, r },
+      label: `Leaf ${i}`,
+      children: [],
+    });
+    topology.find(n => n.id === parentId).children.push(`large-leaf-${i}`);
+  }
+
+  return {
+    description: 'Large hierarchy with ~500 towers for performance testing',
+    layout: 'force-anchors',
+    depth: 'deep',
+    anchors: anchorCount,
+    leaves: leafCount,
+    radius: 25,
+    topology,
+    expected: {
+      leafCells: {},
+      towerPositions: {},
+    },
+  };
+}
+
+export const largeHierarchy500 = Object.freeze(generateLargeHierarchy());
+
+export function buildAlignmentBenchmarkHierarchy() {
+  const entities = [];
+  for (let index = 0; index < 500; index += 1) {
+    entities.push({ id: `benchmark-leaf-${String(index).padStart(3, '0')}`, parentId: null, order: index });
+  }
+  return entities;
+}
+
+export const CANONICAL_FIXTURES = Object.freeze([
+  empty,
+  singleLeaf,
+  conflictingCells,
+  negativeCoordinates,
+  maxRadius,
+  overflowRadius,
+  nonNumericCoordinates,
+  repeatability,
+  largeHierarchy500,
+]);
