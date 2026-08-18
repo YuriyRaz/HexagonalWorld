@@ -1,274 +1,108 @@
 import { expect, test } from 'playwright/test';
-import {
-  buildRepresentativeHierarchy,
-  buildCurrentMaximumHierarchy,
-  buildStructuralMaximumHierarchy
-} from './fixtures/hierarchies.js';
+import { arch, cpus, platform, release, totalmem } from 'node:os';
 
-const FORCE_MODE = 'force-anchors';
-const POLL_TIMEOUT = 300000;
+import { buildAlignmentBenchmarkHierarchy } from './fixtures/hierarchies.js';
+
 const WARMUP_RUNS = 2;
 const MEASURED_RUNS = 10;
-const FRAME_COLLECT_MS = 5000;
-const STARTUP_MAX_MS = 2000;
-const CADENCE_MIN_HZ = 5;
-const CADENCE_MAX_GAP_MS = 200;
-const CADENCE_MIN_PASS_RATE = 0.95;
-const INTERACTION_MAX_MS = 100;
+const WINDOW_MS = 5000;
+const MIN_UPDATES_PER_SECOND = 60;
+const MAX_ALIGNED_LATENCY_MS = 1000;
 
-async function openApp(page) {
-  await page.goto('./', { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('#layout-algorithm')).toBeVisible();
+async function waitForIdle(page, mode) {
+  await expect.poll(async () => page.evaluate(() => {
+    const state = window.__hexWorldTest.getState();
+    return state.busy ? null : state.activeMode;
+  }), { timeout: 300000 }).toBe(mode);
+}
+
+async function runForce(page, selector, entities) {
+  await page.evaluate((value) => window.__hexWorldTest.configureNextRequest({ entities: value }), entities);
+  await selector.selectOption('force-anchors');
+  await waitForIdle(page, 'force-anchors');
+}
+
+test('500-Tower aligned presentation meets every five-second update and settlement budget', { tag: ['@benchmark'] }, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'benchmark-desktop-chromium', 'Reference benchmark evidence is desktop-only.');
+  test.setTimeout(600000);
+  await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
   await expect(page.locator('#loading')).toBeHidden({ timeout: 15000 });
-}
 
-function calculateNearestRankP95(samples) {
-  const sorted = [...samples].sort((a, b) => a - b);
-  const rank = Math.ceil(0.95 * sorted.length);
-  return sorted[rank - 1];
-}
-
-function calculateMedian(samples) {
-  if (samples.length === 0) return 0;
-  const sorted = [...samples].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) {
-    return (sorted[mid - 1] + sorted[mid]) / 2;
+  const selector = page.locator('#layout-algorithm');
+  const entities = buildAlignmentBenchmarkHierarchy();
+  for (let run = 0; run < WARMUP_RUNS; run += 1) {
+    await runForce(page, selector, entities);
+    await selector.selectOption('packed');
+    await waitForIdle(page, 'packed');
   }
-  return sorted[mid];
-}
 
-async function runForceAndWait(page, selector, entities) {
-  await page.evaluate((e) => {
-    window.__hexWorldTest.configureNextRequest({ entities: e });
-  }, entities);
-  await selector.selectOption(FORCE_MODE);
-  await expect.poll(async () => {
-    const state = await page.evaluate(() => window.__hexWorldTest.getState());
-    return state.busy;
-  }, { timeout: POLL_TIMEOUT }).toBe(true);
-  await expect.poll(async () => {
-    const state = await page.evaluate(() => window.__hexWorldTest.getState());
-    return state.busy;
-  }, { timeout: POLL_TIMEOUT }).toBe(false);
-}
+  const metadata = await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl');
+    const debug = gl?.getExtension('WEBGL_debug_renderer_info');
+    return {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      viewport: `${innerWidth}x${innerHeight}`,
+      dpr: devicePixelRatio,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      webglRenderer: debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : 'unavailable',
+      moduleWorker: typeof Worker === 'function',
+    };
+  });
+  metadata.host = {
+    platform: platform(),
+    release: release(),
+    arch: arch(),
+    cpu: cpus()[0]?.model ?? 'unavailable',
+    logicalProcessors: cpus().length,
+    totalMemoryBytes: totalmem(),
+  };
+  metadata.referenceCondition = {
+    os: 'Windows 11 x64',
+    cpu: 'Intel Core i7-1360P',
+    memory: '32 GB',
+    power: 'AC',
+    webgl: 'hardware-accelerated',
+    throttling: 'none',
+  };
+  metadata.matchesDetectableReference = platform() === 'win32'
+    && arch() === 'x64'
+    && /i7-1360P/i.test(metadata.host.cpu)
+    && totalmem() >= 30 * 1024 ** 3
+    && !/swiftshader|software/i.test(metadata.webglRenderer);
+  testInfo.annotations.push({ type: 'reference-condition', description: JSON.stringify(metadata) });
+  console.log(`Benchmark metadata: ${JSON.stringify(metadata)}`);
 
-async function resetToPacked(page, selector) {
-  await selector.selectOption('packed');
-  await expect.poll(async () => {
-    const state = await page.evaluate(() => window.__hexWorldTest.getState());
-    return state.busy;
-  }, { timeout: POLL_TIMEOUT }).toBe(false);
-}
+  const windows = [];
+  for (let run = 0; run < MEASURED_RUNS; run += 1) {
+    await runForce(page, selector, entities);
+    await page.evaluate(() => window.__hexWorldTest.startRenderMeasurement());
+    await page.waitForTimeout(WINDOW_MS);
+    const final = await page.evaluate(() => ({
+      measurement: window.__hexWorldTest.stopRenderMeasurement(),
+      diagnostics: window.__hexWorldTest.getDiagnostics(),
+      alignment: window.__hexWorldTest.getAlignmentDiagnostics(),
+    }));
+    const updatesPerSecond = (final.measurement.count - 1) * 1000
+      / (final.measurement.lastAt - final.measurement.firstAt);
+    const latencyMs = final.diagnostics.firstAlignedSceneLatencyMs;
+    const visibleCellCount = final.alignment.towers.length + final.alignment.emptyCellCount;
+    const measurement = { run: run + 1, updatesPerSecond, latencyMs, visibleCellCount };
+    console.log(`Benchmark window: ${JSON.stringify(measurement)}`);
 
-test.describe('Force-Directed Layout Performance Benchmark', { tag: ['@benchmark'] }, () => {
-  const fixtures = [
-    { name: 'Representative (1200 leaves)', builder: buildRepresentativeHierarchy, threshold: 2000 },
-    { name: 'Current Maximum (4800 leaves)', builder: buildCurrentMaximumHierarchy, threshold: 8000 },
-    { name: 'Structural Maximum (4800 leaves)', builder: buildStructuralMaximumHierarchy, threshold: 8000 }
-  ];
+    expect(final.alignment.towers).toHaveLength(500);
+    expect(new Set(final.alignment.occupiedCells).size).toBe(500);
+    expect(visibleCellCount).toBe(1951);
+    expect(updatesPerSecond).toBeGreaterThanOrEqual(MIN_UPDATES_PER_SECOND);
+    expect(latencyMs).toBeLessThanOrEqual(MAX_ALIGNED_LATENCY_MS);
+    windows.push(measurement);
 
-  for (const f of fixtures) {
-    test(f.name, async ({ page }, testInfo) => {
-      test.setTimeout(600000);
-      await openApp(page);
-
-      const selector = page.locator('#layout-algorithm');
-      const entities = f.builder();
-
-      for (let i = 0; i < WARMUP_RUNS; i++) {
-        await runForceAndWait(page, selector, entities);
-        await resetToPacked(page, selector);
-      }
-
-      const buildTimes = [];
-      const startupTimes = [];
-      const tabLatencies = [];
-      const resetKeyLatencies = [];
-      const resetClickLatencies = [];
-      const resetTapLatencies = [];
-      const allFrameDeltas = [];
-      const allCadenceTimestamps = [];
-
-      for (let run = 0; run < MEASURED_RUNS; run++) {
-        await page.evaluate(() => {
-          window.__cadenceTimestamps = [];
-          const target = document.getElementById('layout-progress');
-          if (target) {
-            const obs = new MutationObserver(() => {
-              window.__cadenceTimestamps.push(performance.now());
-            });
-            obs.observe(target, { childList: true, subtree: true, characterData: true });
-            window.__cadenceObserver = obs;
-          }
-        });
-
-        await page.evaluate((e) => {
-          window.__hexWorldTest.configureNextRequest({ entities: e });
-        }, entities);
-
-        await page.evaluate(() => {
-          window.__benchmarkData = {
-            frameDeltas: [],
-            tabLatency: null,
-            resetKeyLatency: null,
-            resetClickLatency: null,
-            resetTapLatency: null,
-            lastFrameTime: performance.now()
-          };
-          function tick() {
-            const now = performance.now();
-            window.__benchmarkData.frameDeltas.push(now - window.__benchmarkData.lastFrameTime);
-            window.__benchmarkData.lastFrameTime = now;
-            window.__benchmarkFrameId = requestAnimationFrame(tick);
-          }
-          window.__startPostCommitTracking = () => {
-            window.__benchmarkData.frameDeltas = [];
-            window.__benchmarkData.lastFrameTime = performance.now();
-            tick();
-          };
-          window.__stopPostCommitTracking = () => {
-            cancelAnimationFrame(window.__benchmarkFrameId);
-          };
-          window.__instrumentTabResponse = () => {
-            const el = document.getElementById('layout-algorithm');
-            el.addEventListener('keydown', (e) => {
-              if (e.key === 'Tab') {
-                const keydownTime = performance.now();
-                requestAnimationFrame(() => {
-                  window.__benchmarkData.tabLatency = performance.now() - keydownTime;
-                });
-              }
-            }, { once: true });
-          };
-          window.__instrumentResetKey = () => {
-            const el = document.getElementById('reset-view');
-            el.addEventListener('keydown', (e) => {
-              if (e.key === 'Enter') {
-                const t = performance.now();
-                requestAnimationFrame(() => {
-                  window.__benchmarkData.resetKeyLatency = performance.now() - t;
-                });
-              }
-            }, { once: true });
-          };
-          window.__instrumentResetClick = () => {
-            const el = document.getElementById('reset-view');
-            el.addEventListener('click', () => {
-              const t = performance.now();
-              requestAnimationFrame(() => {
-                window.__benchmarkData.resetClickLatency = performance.now() - t;
-              });
-            }, { once: true });
-          };
-          window.__instrumentResetTap = () => {
-            const el = document.getElementById('reset-view');
-            el.addEventListener('touchend', () => {
-              const t = performance.now();
-              requestAnimationFrame(() => {
-                window.__benchmarkData.resetTapLatency = performance.now() - t;
-              });
-            }, { once: true });
-          };
-        });
-
-        const step0Time = performance.now();
-        await selector.selectOption(FORCE_MODE);
-
-        await expect.poll(async () => {
-          const state = await page.evaluate(() => window.__hexWorldTest.getState());
-          return state.busy;
-        }, { timeout: POLL_TIMEOUT }).toBe(true);
-        startupTimes.push(performance.now() - step0Time);
-
-        await page.evaluate(() => window.__instrumentTabResponse());
-        await selector.focus();
-        await page.keyboard.press('Tab');
-
-        await expect.poll(async () => {
-          const state = await page.evaluate(() => window.__hexWorldTest.getState());
-          return state.busy;
-        }, { timeout: POLL_TIMEOUT }).toBe(false);
-        buildTimes.push(performance.now() - step0Time);
-
-        const tabLatency = await page.evaluate(() => window.__benchmarkData.tabLatency);
-        if (tabLatency !== null) tabLatencies.push(tabLatency);
-
-        await page.evaluate(() => {
-          if (window.__cadenceObserver) window.__cadenceObserver.disconnect();
-        });
-        const cadenceTs = await page.evaluate(() => window.__cadenceTimestamps);
-        allCadenceTimestamps.push(...cadenceTs);
-
-        await page.evaluate(() => window.__startPostCommitTracking());
-        await page.waitForTimeout(FRAME_COLLECT_MS);
-        await page.evaluate(() => window.__stopPostCommitTracking());
-        const deltas = await page.evaluate(() => window.__benchmarkData.frameDeltas);
-        allFrameDeltas.push(...deltas);
-
-        await page.evaluate(() => window.__instrumentResetKey());
-        const resetBtn = page.locator('#reset-view');
-        await resetBtn.focus();
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(50);
-        const rk = await page.evaluate(() => window.__benchmarkData.resetKeyLatency);
-        if (rk !== null) resetKeyLatencies.push(rk);
-
-        await page.evaluate(() => window.__instrumentResetClick());
-        await resetBtn.click();
-        await page.waitForTimeout(50);
-        const rc = await page.evaluate(() => window.__benchmarkData.resetClickLatency);
-        if (rc !== null) resetClickLatencies.push(rc);
-
-        const hasTouch = await page.evaluate(() => 'ontouchstart' in window);
-        if (hasTouch) {
-          await page.evaluate(() => window.__instrumentResetTap());
-          await resetBtn.tap();
-          await page.waitForTimeout(50);
-          const rt = await page.evaluate(() => window.__benchmarkData.resetTapLatency);
-          if (rt !== null) resetTapLatencies.push(rt);
-        }
-
-        if (run < MEASURED_RUNS - 1) {
-          await resetToPacked(page, selector);
-        }
-      }
-
-      const p95BuildTime = calculateNearestRankP95(buildTimes);
-      const p95StartupTime = calculateNearestRankP95(startupTimes);
-      const p95TabLatency = tabLatencies.length > 0 ? calculateNearestRankP95(tabLatencies) : 0;
-      const p95ResetKey = resetKeyLatencies.length > 0 ? calculateNearestRankP95(resetKeyLatencies) : 0;
-      const p95ResetClick = resetClickLatencies.length > 0 ? calculateNearestRankP95(resetClickLatencies) : 0;
-      const p95ResetTap = resetTapLatencies.length > 0 ? calculateNearestRankP95(resetTapLatencies) : 0;
-      const medianFrameTime = calculateMedian(allFrameDeltas);
-
-      const cadenceGaps = [];
-      for (let i = 1; i < allCadenceTimestamps.length; i++) {
-        cadenceGaps.push(allCadenceTimestamps[i] - allCadenceTimestamps[i - 1]);
-      }
-      const gapsUnder = cadenceGaps.filter(g => g <= CADENCE_MAX_GAP_MS).length;
-      const cadencePassRate = cadenceGaps.length > 0 ? gapsUnder / cadenceGaps.length : 0;
-      const measuredHz = cadenceGaps.length > 0 ? 1000 / calculateMedian(cadenceGaps) : 0;
-
-      console.log(`--- ${f.name} Results ---`);
-      console.log(`p95 Build Time: ${p95BuildTime.toFixed(2)} ms (limit: ${f.threshold})`);
-      console.log(`p95 Startup Time: ${p95StartupTime.toFixed(2)} ms (limit: ${STARTUP_MAX_MS})`);
-      console.log(`p95 Tab Latency: ${p95TabLatency.toFixed(2)} ms (limit: ${INTERACTION_MAX_MS})`);
-      console.log(`p95 Reset Key: ${p95ResetKey.toFixed(2)} ms (limit: ${INTERACTION_MAX_MS})`);
-      console.log(`p95 Reset Click: ${p95ResetClick.toFixed(2)} ms (limit: ${INTERACTION_MAX_MS})`);
-      console.log(`p95 Reset Tap: ${p95ResetTap.toFixed(2)} ms (limit: ${INTERACTION_MAX_MS})`);
-      console.log(`Median Frame Time: ${medianFrameTime.toFixed(2)} ms (limit: 33.3)`);
-      console.log(`Cadence: ${measuredHz.toFixed(1)} Hz, ${(cadencePassRate * 100).toFixed(1)}% gaps <= ${CADENCE_MAX_GAP_MS}ms`);
-
-      expect(p95BuildTime).toBeLessThan(f.threshold);
-      expect(p95StartupTime).toBeLessThan(STARTUP_MAX_MS);
-      expect(p95TabLatency).toBeLessThan(INTERACTION_MAX_MS);
-      expect(p95ResetKey).toBeLessThan(INTERACTION_MAX_MS);
-      expect(p95ResetClick).toBeLessThan(INTERACTION_MAX_MS);
-      expect(p95ResetTap).toBeLessThan(INTERACTION_MAX_MS);
-      expect(medianFrameTime).toBeLessThan(33.3);
-      expect(measuredHz).toBeGreaterThanOrEqual(CADENCE_MIN_HZ);
-      expect(cadencePassRate).toBeGreaterThanOrEqual(CADENCE_MIN_PASS_RATE);
-    });
+    if (run < MEASURED_RUNS - 1) {
+      await selector.selectOption('packed');
+      await waitForIdle(page, 'packed');
+    }
   }
+
+  console.log(JSON.stringify({ metadata, windows }, null, 2));
 });

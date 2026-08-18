@@ -1,10 +1,21 @@
 import { expect, test } from 'playwright/test';
 import {
+  conflictingCells,
+  empty,
+  largeHierarchy500,
+  maxRadius,
+  negativeCoordinates,
+  nonNumericCoordinates,
+  overflowRadius,
+  repeatability,
+  singleLeaf,
   buildDuplicateIdHierarchy,
+  buildGroupingHierarchy,
   buildSixThousandLinkHierarchy,
   buildSmallValidHierarchy,
   buildVisibilityFixture,
 } from './fixtures/hierarchies.js';
+import { calculateAssignmentHash, FORCE_LAYOUT_CONFIG_V2 } from '../src/force-layout.js';
 
 const FORCE_MODE = 'force-anchors';
 const BUSY_TEXT = /рассчит|вычисл|формир|строим/i;
@@ -82,10 +93,333 @@ async function selectForce(page, configuration = {}) {
   await page.locator('#layout-algorithm').selectOption(FORCE_MODE);
 }
 
+async function expectExactAlignment(page) {
+  const diagnostics = await page.evaluate(() => window.__hexWorldTest.getAlignmentDiagnostics());
+  expect(diagnostics).not.toBeNull();
+  expect(new Set(diagnostics.occupiedCells).size).toBe(diagnostics.towers.length);
+  for (const tower of diagnostics.towers) {
+    const expectedX = 1.3 * Math.sqrt(3) * (tower.q + tower.r / 2);
+    const expectedZ = 1.3 * 1.5 * tower.r;
+    expect([expectedX, Math.fround(expectedX)]).toContain(tower.x);
+    expect([expectedZ, Math.fround(expectedZ)]).toContain(tower.z);
+    expect(diagnostics.occupiedCells).toContain(`${tower.q},${tower.r}`);
+  }
+  return diagnostics;
+}
+
+function canonicalEntities(fixture) {
+  const parentById = new Map();
+  for (const node of fixture.topology) {
+    for (const childId of node.children) parentById.set(childId, node.id);
+  }
+  return fixture.topology.map((node, order) => ({
+    id: node.id,
+    parentId: parentById.get(node.id) ?? null,
+    order,
+  }));
+}
+
+function canonicalLayoutResult(fixture, { rawAssignments = false } = {}) {
+  const placements = fixture.topology
+    .filter((node) => node.type === 'leaf')
+    .map((node) => {
+      const cell = rawAssignments ? node.axial : (fixture.expected.leafCells[node.id] ?? node.axial);
+      return { entityId: node.id, q: cell.q, r: cell.r };
+    });
+  return {
+    requestId: 1,
+    mode: FORCE_MODE,
+    placements,
+    springs: [],
+    gridRadius: fixture.radius,
+    stats: { occupiedCount: placements.length, boundaryGaps: [] },
+    diagnostics: { kind: 'force', converged: true, iterations: 0 },
+  };
+}
+
+function normalizeDisplayedSequence(trace) {
+  return trace.map(({
+    requestId: _requestId,
+    paintedAt: _paintedAt,
+    resourceIdentity: _resourceIdentity,
+    ...frame
+  }) => frame);
+}
+
+function expectDisplayedFrameCoherence(frame) {
+  const fail = (message) => { throw new Error(`Displayed frame ${frame.globalStep}: ${message}`); };
+  if (frame.leafCells.length !== frame.towers.length * 2) fail('incomplete leafCells');
+  const expectedHash = calculateAssignmentHash(
+    frame.towers.map(({ entityId }) => entityId),
+    new Int16Array(frame.leafCells),
+  );
+  if (frame.assignmentHash !== expectedHash) fail('assignment hash mismatch');
+  const keys = frame.towers.map(({ q, r }) => `${q},${r}`);
+  if (new Set(keys).size !== frame.towers.length) fail('duplicate Tower cell');
+  if (JSON.stringify(frame.occupiedCells) !== JSON.stringify([...keys].sort())) fail('occupancy mismatch');
+  for (let index = 0; index < frame.towers.length; index += 1) {
+    const tower = frame.towers[index];
+    if (!Number.isInteger(tower.q) || !Number.isInteger(tower.r)) fail(`non-integer Tower ${tower.entityId}`);
+    if (frame.leafCells[index * 2] !== tower.q || frame.leafCells[index * 2 + 1] !== tower.r) fail(`cell order mismatch for ${tower.entityId}`);
+    const expectedX = Math.fround(1.3 * Math.sqrt(3) * (tower.q + tower.r / 2));
+    const expectedZ = Math.fround(1.3 * 1.5 * tower.r);
+    if (Math.abs(tower.x - expectedX) >= 0.0000005 || Math.abs(tower.z - expectedZ) >= 0.0000005) fail(`center mismatch for ${tower.entityId}`);
+  }
+  for (const spring of frame.springEndpoints) {
+    for (const endpoint of [spring.source, spring.target]) {
+      if (endpoint.kind === 'leaf') {
+        const tower = frame.towers.find(({ entityId }) => entityId === endpoint.entityId);
+        if (!tower || endpoint.x !== tower.x || endpoint.z !== tower.z) fail(`leaf spring mismatch for ${endpoint.entityId}`);
+      } else {
+        if (endpoint.x !== endpoint.simulationX || endpoint.z !== endpoint.simulationZ) fail(`anchor spring mismatch for ${endpoint.entityId}`);
+      }
+    }
+  }
+}
+
+function cameraDistance(state) {
+  return Math.hypot(
+    state.position.x - state.target.x,
+    state.position.y - state.target.y,
+    state.position.z - state.target.z,
+  );
+}
+
+function vectorShift(first, second, field) {
+  return Math.hypot(
+    first[field].x - second[field].x,
+    first[field].y - second[field].y,
+    first[field].z - second[field].z,
+  );
+}
+
+async function dispatchTouchGesture(page, points) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: points[0] });
+    for (const touchPoints of points.slice(1)) {
+      await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints });
+    }
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally {
+    await session.detach();
+  }
+  await page.waitForTimeout(350);
+}
+
 function deterministicResult(state) {
   const { requestId: _requestId, ...result } = state.activeResult;
   return result;
 }
+
+test.describe('tower-to-cell alignment', { tag: ['@tower-cell-alignment', '@visual'] }, () => {
+  test('preserves exact assignments across every layout mode', async ({ page }) => {
+    test.setTimeout(180000);
+    await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#loading')).toHaveClass(/is-hidden/, { timeout: 30000 });
+    const selector = page.locator('#layout-algorithm');
+    const entities = buildGroupingHierarchy();
+    const forceConfig = structuredClone(FORCE_LAYOUT_CONFIG_V2);
+    forceConfig.maxCoolingSteps = 96;
+    forceConfig.alphaSchedule.decay = 1 - Math.pow(
+      forceConfig.alphaSchedule.minimum / forceConfig.alphaSchedule.initial,
+      1 / forceConfig.maxCoolingSteps,
+    );
+
+    for (const mode of ['flat', 'nested', 'packed', FORCE_MODE]) {
+      await configureNextRequest(page, { entities, forceConfig });
+      await selector.selectOption(mode);
+      await waitForActiveMode(page, mode);
+      await expectExactAlignment(page);
+    }
+  });
+
+  test('uses actual configured pointer/touch camera controls, Reset, and resize with zero world-coordinate shift', async ({ page }, testInfo) => {
+    test.setTimeout(180000);
+    await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#loading')).toHaveClass(/is-hidden/, { timeout: 30000 });
+    await selectForce(page);
+    await waitForActiveMode(page, FORCE_MODE);
+    const baseline = await expectExactAlignment(page);
+    const canvas = page.locator('#world');
+    const box = await canvas.boundingBox();
+    expect(box).toBeTruthy();
+    // Stay to the right of the responsive form overlay so native input reaches OrbitControls.
+    const x = box.x + box.width * 0.84;
+    const y = box.y + box.height * 0.42;
+    const hasTouch = testInfo.project.use.hasTouch === true;
+
+    let camera = await page.evaluate(() => window.__hexWorldTest.getCameraState());
+    if (hasTouch) {
+      await dispatchTouchGesture(page, [
+        [{ x, y, id: 1, radiusX: 2, radiusY: 2 }],
+        [{ x: x + 70, y: y - 35, id: 1, radiusX: 2, radiusY: 2 }],
+      ]);
+    } else {
+      await page.mouse.move(x, y);
+      await page.mouse.down({ button: 'left' });
+      await page.mouse.move(x + 90, y - 45, { steps: 8 });
+      await page.mouse.up({ button: 'left' });
+      await page.waitForTimeout(350);
+    }
+    let changed = await page.evaluate(() => window.__hexWorldTest.getCameraState());
+    expect(vectorShift(camera, changed, 'position')).toBeGreaterThan(0.01);
+    expect((await expectExactAlignment(page)).towers).toEqual(baseline.towers);
+    camera = changed;
+
+    if (hasTouch) {
+      await dispatchTouchGesture(page, [
+        [{ x: x - 20, y, id: 1 }, { x: x + 20, y, id: 2 }],
+        [{ x: x + 5, y: y + 35, id: 1 }, { x: x + 45, y: y + 35, id: 2 }],
+      ]);
+    } else {
+      await page.mouse.move(x, y);
+      await page.mouse.down({ button: 'right' });
+      await page.mouse.move(x + 75, y + 45, { steps: 8 });
+      await page.mouse.up({ button: 'right' });
+      await page.waitForTimeout(350);
+    }
+    changed = await page.evaluate(() => window.__hexWorldTest.getCameraState());
+    expect(vectorShift(camera, changed, 'target')).toBeGreaterThan(0.01);
+    expect((await expectExactAlignment(page)).towers).toEqual(baseline.towers);
+    camera = changed;
+
+    if (hasTouch) {
+      await dispatchTouchGesture(page, [
+        [{ x: x - 20, y, id: 1 }, { x: x + 20, y, id: 2 }],
+        [{ x: x - 50, y, id: 1 }, { x: x + 50, y, id: 2 }],
+      ]);
+    } else {
+      await page.mouse.move(x, y);
+      await page.mouse.wheel(0, 600);
+      await page.waitForTimeout(350);
+    }
+    changed = await page.evaluate(() => window.__hexWorldTest.getCameraState());
+    expect(Math.abs(cameraDistance(camera) - cameraDistance(changed))).toBeGreaterThan(0.01);
+    expect((await expectExactAlignment(page)).towers).toEqual(baseline.towers);
+
+    if (hasTouch) await page.locator('#reset-view').tap();
+    else await page.locator('#reset-view').click();
+    await page.waitForTimeout(1000);
+    expect((await expectExactAlignment(page)).towers).toEqual(baseline.towers);
+
+    const viewport = page.viewportSize();
+    await page.setViewportSize({ width: Math.max(320, viewport.width - 48), height: Math.max(560, viewport.height - 52) });
+    await page.waitForTimeout(350);
+    expect((await expectExactAlignment(page)).towers).toEqual(baseline.towers);
+  });
+
+  test('presents every normal frame coherently and produces the same complete displayed sequence in 20 runs', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-chromium', 'Twenty complete displayed runs are recorded once in the desktop evidence profile.');
+    test.setTimeout(780000);
+    await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#loading')).toHaveClass(/is-hidden/, { timeout: 30000 });
+    const selector = page.locator('#layout-algorithm');
+    const entities = buildGroupingHierarchy();
+    const forceConfig = structuredClone(FORCE_LAYOUT_CONFIG_V2);
+    forceConfig.maxCoolingSteps = 96;
+    forceConfig.alphaSchedule.decay = 1 - Math.pow(
+      forceConfig.alphaSchedule.minimum / forceConfig.alphaSchedule.initial,
+      1 / forceConfig.maxCoolingSteps,
+    );
+    let baseline;
+
+    for (let run = 0; run < 20; run += 1) {
+      if (run > 0) {
+        await configureNextRequest(page, { entities });
+        await selector.selectOption('packed');
+        await waitForActiveMode(page, 'packed');
+      }
+      await configureNextRequest(page, { entities, forceConfig });
+      await selector.selectOption(FORCE_MODE);
+      await waitForActiveMode(page, FORCE_MODE);
+      const trace = await page.evaluate(() => window.__hexWorldTest.forceSession.trace());
+      if (trace.length <= 5) throw new Error(`Run ${run + 1} displayed only ${trace.length} frames`);
+      for (let index = 0; index < trace.length; index += 1) {
+        if (trace[index].globalStep !== index) throw new Error(`Run ${run + 1} skipped displayed step ${index}`);
+        expectDisplayedFrameCoherence(trace[index]);
+        if (index > 0) {
+          if (trace[index].assignmentRevision < trace[index - 1].assignmentRevision) throw new Error(`Run ${run + 1} regressed assignment revision at step ${index}`);
+          if (trace[index].assignmentRevision === trace[index - 1].assignmentRevision) {
+            if (trace[index].assignmentHash !== trace[index - 1].assignmentHash
+              || JSON.stringify(trace[index].leafCells) !== JSON.stringify(trace[index - 1].leafCells)) {
+              throw new Error(`Run ${run + 1} changed an unchanged revision at step ${index}`);
+            }
+          }
+        }
+      }
+      const normalized = JSON.stringify(normalizeDisplayedSequence(trace));
+      if (baseline === undefined) baseline = normalized;
+      else if (normalized !== baseline) throw new Error(`Run ${run + 1} complete displayed sequence differs from run 1`);
+    }
+  });
+
+  test('presents or rolls back every canonical empty, single, conflict, negative, boundary, invalid, non-finite, rapid, and 500-Tower state', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-chromium', 'Canonical end-to-end state matrix is recorded once in the desktop evidence profile.');
+    test.setTimeout(360000);
+    await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#loading')).toHaveClass(/is-hidden/, { timeout: 30000 });
+    const selector = page.locator('#layout-algorithm');
+
+    for (const fixture of [singleLeaf, conflictingCells, negativeCoordinates, maxRadius, largeHierarchy500]) {
+      await configureNextRequest(page, {
+        entities: canonicalEntities(fixture),
+        layoutResult: canonicalLayoutResult(fixture),
+      });
+      if (await selector.inputValue() === FORCE_MODE) await forceRebuild(page);
+      else await selector.selectOption(FORCE_MODE);
+      await waitForActiveMode(page, FORCE_MODE);
+      const diagnostics = await expectExactAlignment(page);
+      expect(diagnostics.towers).toHaveLength(fixture.leaves);
+      if (fixture === maxRadius) expect(diagnostics.towers[0].q).toBe(256);
+      if (fixture === largeHierarchy500) {
+        expect(diagnostics.towers).toHaveLength(500);
+        expect(diagnostics.towers.length + diagnostics.emptyCellCount).toBe(1951);
+      }
+    }
+
+    for (const fixture of [empty, overflowRadius, nonNumericCoordinates]) {
+      const previous = await getState(page);
+      const previousAlignment = await page.evaluate(() => window.__hexWorldTest.getAlignmentDiagnostics());
+      await configureNextRequest(page, fixture === empty ? { entities: [] } : {
+        entities: canonicalEntities(fixture),
+        layoutResult: canonicalLayoutResult(fixture, { rawAssignments: true }),
+      });
+      await forceRebuild(page);
+      await expect.poll(async () => (await getState(page)).busy).toBe(false);
+      const retained = await getState(page);
+      expect(retained.lastErrorCode).not.toBeNull();
+      expect(retained.activeRootId).toBe(previous.activeRootId);
+      expect(retained.activeResult).toEqual(previous.activeResult);
+      expect((await expectExactAlignment(page)).towers).toEqual(previousAlignment.towers);
+    }
+
+    await selector.selectOption('packed');
+    await waitForActiveMode(page, 'packed');
+    await configureNextRequest(page, { entities: canonicalEntities(repeatability), delayMs: 100 });
+    await selector.selectOption(FORCE_MODE);
+    await configureNextRequest(page, {
+      entities: canonicalEntities(negativeCoordinates),
+      layoutResult: canonicalLayoutResult(negativeCoordinates),
+    });
+    await forceRebuild(page);
+    await waitForActiveMode(page, FORCE_MODE);
+    const newest = await expectExactAlignment(page);
+    expect(newest.towers.map(({ entityId }) => entityId).sort()).toEqual(['neg-1', 'neg-2', 'neg-3']);
+  });
+
+  test('uses one final aligned presentation under reduced motion', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('./?testDiagnostics=1', { waitUntil: 'domcontentloaded' });
+    await expect(page.locator('#loading')).toHaveClass(/is-hidden/, { timeout: 30000 });
+    await selectForce(page);
+    await waitForActiveMode(page, FORCE_MODE);
+    await expectExactAlignment(page);
+    const trace = await page.evaluate(() => window.__hexWorldTest.forceSession.trace());
+    expect(trace).toHaveLength(1);
+    expect(trace[0].terminal).toBe('converged');
+  });
+});
 
 async function expectReachable(locator, viewport) {
   const receivesHit = await locator.evaluate((element) => {
@@ -239,17 +573,16 @@ test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-
     await expectReachable(page.locator('#algorithm-note'), shortViewport);
   });
 
-  test('commits a static result when reduced motion is requested', async ({ page }) => {
+  test('keeps force-directed layout running indefinitely when reduced motion is requested', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await openApp(page);
     await expectTestApi(page);
 
     await selectForce(page, { delayMs: 80 });
-    await waitForSuccess(page);
+    await waitForActiveMode(page, FORCE_MODE);
     const committed = await getState(page);
 
     expect(committed.activeResult.mode).toBe(FORCE_MODE);
-    expect(committed.activeResult.diagnostics.converged).toBe(true);
     expect(committed.busy).toBe(false);
 
     await page.waitForTimeout(300);
@@ -258,7 +591,7 @@ test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-
     expect(afterSettling.activeResult).toEqual(committed.activeResult);
   });
 
-  test('promote-in-place keeps the same scene root across the force commit transition', async ({ page }) => {
+  test('keeps the simulation running indefinitely without resetting the active island root UUID', async ({ page }) => {
     await openApp(page);
     await expectTestApi(page);
 
@@ -277,6 +610,24 @@ test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-
     expect(committedState.activeRootVisible).toBe(true);
     expect(committedState.activeRootInWorld).toBe(true);
     expect(committedState.activeResult.mode).toBe(FORCE_MODE);
+
+    // Verify step count is shown in status bar
+    await expect(page.locator('#layout-status')).toContainText(/сошлась на шаге \d+/);
+  });
+
+  test('updates convergence status elements correctly during simulation steps', async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await selectForce(page, { delayMs: 80 });
+
+    const streakElement = page.locator('[data-force-progress="streak"]');
+    const stepElement = page.locator('[data-force-progress="global"]');
+    const terminalElement = page.locator('[data-force-progress="terminal"]');
+
+    await expect(stepElement).toContainText(/Шаг:\s+\d+/);
+    await expect(streakElement).toContainText(/Серия сходимости:\s+\d+\s*\/\s*8/);
+    await expect(terminalElement).toContainText(/Причина:\s+.+/);
   });
 
   test('hides the tab with one outstanding frame and restores the same frame', { tag: ['@US2-usable-lifecycle'] }, async ({ page }) => {

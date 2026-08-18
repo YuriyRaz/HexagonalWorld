@@ -3,6 +3,7 @@ import { inspect } from 'node:util';
 import { describe, test } from 'node:test';
 
 import { createLayoutRunner } from '../src/layout-runner.js';
+import { calculateAssignmentHash } from '../src/force-layout.js';
 
 const FORCE_MODE = 'force-anchors';
 const WORKER_EVENTS = ['error', 'message', 'messageerror'];
@@ -662,17 +663,20 @@ describe('command receipt guards', () => {
   }
 
   function buildV2ReadyResponse(requestId) {
+    const leafCells = new Int16Array([0, 0]);
     return {
       type: 'ready',
       requestId,
       globalStep: 0,
       epoch: 0,
+      epochStep: 0,
       coolingStep: 0,
       topology: buildV2Topology(requestId),
       positions: new Float32Array([0, 0, 0, 0]),
+      leafCells,
       terminal: 'none',
       assignmentRevision: 0,
-      assignmentHash: 0,
+      assignmentHash: calculateAssignmentHash(['leaf-a'], leafCells),
       stableStreak: 0,
       maxMovement: 0,
       rmsMovement: 0,
@@ -681,18 +685,45 @@ describe('command receipt guards', () => {
     };
   }
 
+  function buildV2StepResponse(requestId, overrides = {}) {
+    const leafCells = new Int16Array(overrides.leafCells ?? [0, 0]);
+    return {
+      type: 'step',
+      requestId,
+      globalStep: 1,
+      epoch: 0,
+      epochStep: 1,
+      coolingStep: 1,
+      positions: new Float32Array([0, 0, 0, 0]),
+      leafCells,
+      terminal: 'none',
+      assignmentRevision: 0,
+      assignmentHash: calculateAssignmentHash(['leaf-a'], leafCells),
+      stableStreak: 0,
+      maxMovement: 0,
+      rmsMovement: 0,
+      maxTargetError: 0,
+      rmsTargetError: 0,
+      ...overrides,
+    };
+  }
+
   function buildV2SuccessResponse(requestId) {
+    const leafCells = new Int16Array([0, 0]);
+    const assignmentHash = calculateAssignmentHash(['leaf-a'], leafCells);
     const result = {
       requestId,
       mode: FORCE_MODE,
       placements: [{ entityId: 'leaf-a', q: 0, r: 0 }],
+      leafCells: { 'leaf-a': { q: 0, r: 0 } },
+      towerPositions: { 'leaf-a': { x: 0, z: 0 } },
       springs: [{
         source: { kind: 'leaf', entityId: 'leaf-a', q: 0, r: 0 },
         target: { kind: 'anchor', entityId: 'root', q: 0, r: 0 },
       }],
       gridRadius: 1,
       stats: { occupiedCount: 1, boundaryGaps: [] },
-      diagnostics: { version: 2, globalStep: 1, assignmentHash: 0 },
+      diagnostics: { version: 2, globalStep: 1, epoch: 0, assignmentRevision: 0, assignmentHash },
     };
     const terminalFrame = {
       requestId,
@@ -701,20 +732,81 @@ describe('command receipt guards', () => {
       epochStep: 0,
       coolingStep: 1,
       positions: new Float32Array([0, 0, 0, 0]),
+      leafCells,
+      assignmentRevision: 0,
+      assignmentHash,
+      stableStreak: 8,
+      maxMovement: 0,
+      rmsMovement: 0,
+      maxTargetError: 0,
+      rmsTargetError: 0,
       terminal: 'converged',
       result,
     };
-    return { type: 'success', requestId, globalStep: 1, result, terminalFrame };
+    return {
+      type: 'success',
+      requestId,
+      epoch: 0,
+      globalStep: 1,
+      topology: buildV2Topology(requestId),
+      result,
+      terminalFrame,
+    };
   }
 
   async function reachRetainedSettled(runner, workers, requestId) {
     const layoutPromise = runner.runLayout(buildV2Request(requestId));
     const worker = workers[0];
-    worker.emitMessage(buildV2ReadyResponse(requestId));
-    worker.emitMessage(buildV2SuccessResponse(requestId));
+    const ready = buildV2ReadyResponse(requestId);
+    worker.emitMessage(ready);
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
     await layoutPromise;
     runner.confirmSessionResultCommitted(requestId);
     return worker;
+  }
+
+  async function expectInitialSequenceFailure(name, mutate) {
+    const requestId = 1000;
+    const { runner, workers, timers } = makeHarness();
+    const presented = [];
+    const layoutPromise = runner.runLayout(buildV2Request(requestId), {
+      onReady: (_topology, frame) => {
+        presented.push({ type: 'ready', cells: Array.from(frame.leafCells) });
+      },
+      onStep: (frame) => {
+        presented.push({ type: 'step', cells: Array.from(frame.leafCells) });
+      },
+    });
+    const outcomePromise = layoutPromise.then(
+      () => ({ result: 'resolved' }),
+      (error) => ({ result: 'rejected', error }),
+    );
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    const malformed = buildV2StepResponse(requestId);
+    mutate(malformed);
+    worker.emitMessage(malformed);
+    const outcome = await Promise.race([
+      outcomePromise,
+      new Promise((resolve) => setImmediate(() => resolve({ result: 'pending' }))),
+    ]);
+
+    try {
+      assert.equal(outcome.result, 'rejected', `${name} must fail the protocol immediately`);
+      assertOperationError(outcome.error, { requestId, code: 'PROTOCOL_ERROR', silent: false });
+      assert.deepEqual(presented, [{ type: 'ready', cells: [0, 0] }], `${name} must not reach onStep`);
+      assertWorkerCleaned(worker, timers);
+    } finally {
+      if (outcome.result === 'pending') {
+        runner.dispose();
+        await outcomePromise;
+      }
+    }
   }
 
   test('expired command guard timer rejects caller with CONTROL_TIMEOUT', async () => {
@@ -791,7 +883,11 @@ describe('command receipt guards', () => {
     const layoutPromise = runner.runLayout(buildV2Request(requestId));
     const worker = workers[0];
     worker.emitMessage(buildV2ReadyResponse(requestId));
-    worker.emitMessage(buildV2SuccessResponse(requestId));
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
     await layoutPromise;
     runner.confirmSessionResultCommitted(requestId);
 
@@ -813,5 +909,252 @@ describe('command receipt guards', () => {
       assert.equal(error.code, 'CANCELLED');
       return true;
     });
+  });
+
+  test('resolved v2 result includes leafCells and towerPositions', async () => {
+    const requestId = 900;
+    const { runner, workers } = makeHarness();
+    const layoutPromise = runner.runLayout(buildV2Request(requestId));
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
+    const result = await layoutPromise;
+    assert.ok(result.leafCells, 'result must have leafCells');
+    assert.ok(result.towerPositions, 'result must have towerPositions');
+    assert.ok('leaf-a' in result.leafCells);
+    assert.ok('leaf-a' in result.towerPositions);
+    assert.equal(result.leafCells['leaf-a'].q, 0);
+    assert.equal(result.leafCells['leaf-a'].r, 0);
+    assert.equal(typeof result.towerPositions['leaf-a'].x, 'number');
+    assert.equal(typeof result.towerPositions['leaf-a'].z, 'number');
+  });
+
+  test('v2 ready frame requires canonical typed leafCells and dual receipts', async () => {
+    const requestId = 901;
+    const { runner, workers } = makeHarness();
+    let readyFrame = null;
+    const layoutPromise = runner.runLayout(buildV2Request(requestId), {
+      onReady: (_topology, frame) => {
+        readyFrame = frame;
+        return { requestId, globalStep: frame.globalStep, positionBuffer: frame.positions.buffer, cellBuffer: frame.leafCells.buffer };
+      },
+    });
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
+    await layoutPromise;
+    assert.ok(readyFrame, 'onReady must have been called');
+    assert.ok(readyFrame.leafCells instanceof Int16Array, 'ready frame must have typed leafCells');
+  });
+
+  test('validates leafCells typed array, length, radius <= 256, uniqueness, and rejects malformed snapshots', async () => {
+    const requestId = 902;
+    const { runner, workers } = makeHarness();
+    const layoutPromise = runner.runLayout(buildV2Request(requestId));
+    const worker = workers[0];
+
+    const malformedReady = buildV2ReadyResponse(requestId);
+    malformedReady.leafCells = new Int16Array([300, 0]); // Out of radius > 256
+    worker.emitMessage(malformedReady);
+
+    await assert.rejects(layoutPromise, (error) => {
+      assertOperationError(error, {
+        requestId,
+        code: 'PROTOCOL_ERROR',
+        silent: false,
+      });
+      return true;
+    });
+  });
+
+  for (const [name, mutate] of [
+    ['epoch jump', (frame) => { frame.epoch = 2; frame.epochStep = 1; }],
+    ['epoch transition before retained settlement', (frame) => { frame.epoch = 1; frame.epochStep = 1; }],
+    ['assignment revision jump', (frame) => {
+      frame.assignmentRevision = 2;
+      frame.leafCells = new Int16Array([1, 0]);
+      frame.assignmentHash = calculateAssignmentHash(['leaf-a'], frame.leafCells);
+    }],
+    ['changed cells and hash under an unchanged revision', (frame) => {
+      frame.leafCells = new Int16Array([1, 0]);
+      frame.assignmentHash = calculateAssignmentHash(['leaf-a'], frame.leafCells);
+    }],
+    ['changed hash under an unchanged revision', (frame) => { frame.assignmentHash ^= 1; }],
+    ['assignment revision increment with unchanged cells', (frame) => { frame.assignmentRevision = 1; }],
+  ]) {
+    test(`rejects ${name} before presentation and preserves the prior frame`, async () => {
+      await expectInitialSequenceFailure(name, mutate);
+    });
+  }
+
+  test('rejects assignment revision regression before presentation and cleans the protocol', async () => {
+    const requestId = 1001;
+    const { runner, workers, timers } = makeHarness();
+    const presented = [];
+    const layoutPromise = runner.runLayout(buildV2Request(requestId), {
+      onReady: (_topology, frame) => { presented.push(Array.from(frame.leafCells)); },
+      onStep: (frame) => { presented.push(Array.from(frame.leafCells)); },
+    });
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    worker.emitMessage(buildV2StepResponse(requestId, {
+      globalStep: 1,
+      assignmentRevision: 1,
+      leafCells: new Int16Array([1, 0]),
+      assignmentHash: calculateAssignmentHash(['leaf-a'], new Int16Array([1, 0])),
+    }));
+    await Promise.resolve();
+    worker.emitMessage(buildV2StepResponse(requestId, {
+      globalStep: 2,
+      epochStep: 2,
+      coolingStep: 2,
+      assignmentRevision: 0,
+    }));
+
+    await assert.rejects(layoutPromise, (error) => assertOperationError(error, {
+      requestId,
+      code: 'PROTOCOL_ERROR',
+      silent: false,
+    }));
+    assert.deepEqual(presented, [[0, 0], [1, 0]]);
+    assertWorkerCleaned(worker, timers);
+  });
+
+  test('rejects a retained-session epoch regression without invoking another callback', async () => {
+    const requestId = 1002;
+    const epochReady = [];
+    const steps = [];
+    const { runner, workers, timers } = makeHarness();
+    const layoutPromise = runner.runLayout(buildV2Request(requestId), {
+      onEpochReady: (identity, frame) => { epochReady.push({ identity, epoch: frame.epoch }); },
+      onStep: (frame) => { steps.push(frame.epoch); },
+    });
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
+    await layoutPromise;
+    runner.confirmSessionResultCommitted(requestId);
+    const epochSettlement = runner.waitForEpochSettlement(requestId, 1);
+
+    worker.emitMessage(buildV2StepResponse(requestId, {
+      globalStep: 2,
+      epoch: 1,
+      epochStep: 1,
+      coolingStep: 1,
+    }));
+    await Promise.resolve();
+    worker.emitMessage(buildV2StepResponse(requestId, {
+      globalStep: 3,
+      epoch: 0,
+      epochStep: 2,
+      coolingStep: 2,
+    }));
+    const outcome = await Promise.race([
+      epochSettlement.then(
+        () => ({ result: 'resolved' }),
+        (error) => ({ result: 'rejected', error }),
+      ),
+      new Promise((resolve) => setImmediate(() => resolve({ result: 'pending' }))),
+    ]);
+
+    try {
+      assert.equal(outcome.result, 'rejected');
+      assertOperationError(outcome.error, { requestId, code: 'PROTOCOL_ERROR', silent: false });
+      assert.deepEqual(epochReady.map(({ epoch }) => epoch), [1]);
+      assert.deepEqual(steps, [0]);
+      assertWorkerCleaned(worker, timers);
+    } finally {
+      if (outcome.result === 'pending') runner.dispose();
+    }
+  });
+
+  test('rejects a terminal sequence mismatch before the settlement callback', async () => {
+    const requestId = 1005;
+    let settlementCalls = 0;
+    const { runner, workers, timers } = makeHarness();
+    const layoutPromise = runner.runLayout(buildV2Request(requestId), {
+      onInitialSettled: () => { settlementCalls += 1; },
+    });
+    const worker = workers[0];
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+    const success = buildV2SuccessResponse(requestId);
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    success.terminalFrame.assignmentRevision = 1;
+    success.result.diagnostics.assignmentRevision = 1;
+    success.terminalFrame.result = success.result;
+    worker.emitMessage(success);
+
+    await assert.rejects(layoutPromise, (error) => assertOperationError(error, {
+      requestId,
+      code: 'PROTOCOL_ERROR',
+      silent: false,
+    }));
+    assert.equal(settlementCalls, 0);
+    assertWorkerCleaned(worker, timers);
+  });
+
+  test('preserves valid retained epoch callbacks and final-only settlement behavior', async () => {
+    const retainedRequestId = 1003;
+    const retainedCallbacks = [];
+    const retainedHarness = makeHarness();
+    const retainedPromise = retainedHarness.runner.runLayout(buildV2Request(retainedRequestId), {
+      onEpochReady: (_identity, frame) => { retainedCallbacks.push(`ready:${frame.epoch}`); },
+      onStep: (frame) => { retainedCallbacks.push(`step:${frame.epoch}`); },
+    });
+    const retainedWorker = retainedHarness.workers[0];
+    retainedWorker.emitMessage(buildV2ReadyResponse(retainedRequestId));
+    await Promise.resolve();
+    const retainedSuccess = buildV2SuccessResponse(retainedRequestId);
+    retainedWorker.emitMessage({ type: 'step', ...retainedSuccess.terminalFrame });
+    await Promise.resolve();
+    retainedWorker.emitMessage(retainedSuccess);
+    await retainedPromise;
+    retainedHarness.runner.confirmSessionResultCommitted(retainedRequestId);
+    retainedWorker.emitMessage(buildV2StepResponse(retainedRequestId, {
+      globalStep: 2,
+      epoch: 1,
+      epochStep: 1,
+      coolingStep: 1,
+    }));
+    await Promise.resolve();
+    retainedWorker.emitMessage(buildV2StepResponse(retainedRequestId, {
+      globalStep: 3,
+      epoch: 1,
+      epochStep: 2,
+      coolingStep: 2,
+    }));
+    await Promise.resolve();
+    assert.deepEqual(retainedCallbacks, ['step:0', 'ready:1', 'step:1']);
+    retainedHarness.runner.dispose();
+
+    const finalRequestId = 1004;
+    const finalCallbacks = [];
+    const finalHarness = makeHarness();
+    const finalPromise = finalHarness.runner.runLayout(buildV2Request(finalRequestId), {
+      presentation: 'final-only',
+      onReady: () => finalCallbacks.push('ready'),
+      onStep: () => finalCallbacks.push('step'),
+      onInitialSettled: () => finalCallbacks.push('settled'),
+    });
+    finalHarness.workers[0].emitMessage(buildV2SuccessResponse(finalRequestId));
+    await finalPromise;
+    assert.deepEqual(finalCallbacks, ['settled']);
+    finalHarness.runner.confirmSessionResultCommitted(finalRequestId);
+    finalHarness.runner.dispose();
   });
 });

@@ -4,6 +4,8 @@ import { describe, test } from 'node:test';
 import * as THREE from 'three';
 
 import { createIsland, createLiveIsland } from '../src/island.js';
+import { calculateAssignmentHash } from '../src/force-layout.js';
+import { axialToPlane } from '../src/hex.js';
 
 const GENERIC_PAYLOAD_FIELDS = [
   'entityId',
@@ -467,34 +469,50 @@ describe('createIsland object model', () => {
   });
 });
 
+function makeForceFrame(topology, positions, leafCells, globalStep = 0, assignmentRevision = 0) {
+  const cells = new Int16Array(leafCells);
+  const leafIds = topology.nodeIds.filter((_, index) => topology.nodeKinds[index] === 'leaf');
+  return {
+    requestId: topology.requestId,
+    globalStep,
+    epoch: 0,
+    epochStep: globalStep,
+    coolingStep: globalStep,
+    positions: new Float32Array(positions),
+    leafCells: cells,
+    assignmentRevision,
+    assignmentHash: calculateAssignmentHash(leafIds, cells),
+    terminal: 'none',
+  };
+}
+
+function makeForceInput(positions, globalStep = 0, leafCells = [0, 0, 1, 0]) {
+  const topology = {
+    requestId: 1,
+    nodeIds: ['entity-alpha', 'entity-beta'],
+    nodeKinds: ['leaf', 'leaf'],
+    relations: [],
+  };
+  const initialFrame = makeForceFrame(topology, positions, leafCells, globalStep);
+  return {
+    visualPayloadByEntityId: makePayloadMap(),
+    topology,
+    initialFrame,
+    presentation: { occupiedOpacity: 0.5, showSprings: false },
+  };
+}
+
 describe('createLiveIsland and applyStep', () => {
-  function makeForceInput(positions, globalStep = 0) {
-    const topology = {
-      requestId: 1,
-      nodeIds: ['entity-alpha', 'entity-beta'],
-      nodeKinds: ['leaf', 'leaf'],
-      relations: [],
-    };
-    const initialFrame = {
-      requestId: 1,
-      globalStep,
-      positions: new Float32Array(positions),
-    };
-    return {
-      visualPayloadByEntityId: makePayloadMap(),
-      topology,
-      initialFrame,
-      presentation: { occupiedOpacity: 0.5, showSprings: false },
-    };
-  }
 
   test('createLiveIsland creates valid instances with correct entityId mapping', () => {
     const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
     try {
       assert.ok(handle.root instanceof THREE.Group);
-      assert.equal(handle.interactiveTiles.length, 1);
-      const occupied = handle.interactiveTiles[0];
+      assert.equal(handle.interactiveTiles.length, 2);
+      const occupied = handle.interactiveTiles.find((tile) => tile.userData.isEmpty !== true);
+      const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
       assert.ok(occupied instanceof THREE.InstancedMesh);
+      assert.ok(empty instanceof THREE.InstancedMesh);
       assert.equal(occupied.count, 2);
       assert.equal(occupied.userData.instances.length, 2);
       assert.equal(occupied.userData.instances[0].entityId, 'entity-alpha');
@@ -510,21 +528,11 @@ describe('createLiveIsland and applyStep', () => {
     const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
     try {
       const occupied = handle.interactiveTiles[0];
-      const sphereBefore = occupied.boundingSphere.clone();
-
-      handle.applyStep({
-        requestId: 1,
-        globalStep: 1,
-        positions: new Float32Array([1, 2, 6, 5]),
-      });
+      handle.applyStep(makeForceFrame(makeForceInput([]).topology, [100, 100, -100, -100], [1, 0, 2, 0], 1, 1));
 
       assert.ok(occupied.boundingSphere.radius > 0);
-      assert.notEqual(occupied.boundingSphere.center.x, sphereBefore.center.x, 'bounding sphere center must change after step');
-      assert.notEqual(occupied.boundingSphere.center.z, sphereBefore.center.z, 'bounding sphere center must change after step');
-      assert.equal(occupied.userData.instances[0].x, 1);
-      assert.equal(occupied.userData.instances[0].z, 2);
-      assert.equal(occupied.userData.instances[1].x, 6);
-      assert.equal(occupied.userData.instances[1].z, 5);
+      assert.equal(occupied.userData.instances[0].x, Math.fround(axialToPlane(1, 0).x));
+      assert.equal(occupied.userData.instances[1].x, Math.fround(axialToPlane(2, 0).x));
     } finally {
       handle.dispose();
     }
@@ -534,7 +542,7 @@ describe('createLiveIsland and applyStep', () => {
     const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
     try {
       assert.throws(
-        () => handle.applyStep({ requestId: 1, globalStep: 5, positions: new Float32Array([0, 0, 5, 3]) }),
+        () => handle.applyStep(makeForceFrame(makeForceInput([]).topology, [0, 0, 5, 3], [0, 0, 1, 0], 5)),
         /Island rendering failed./,
       );
     } finally {
@@ -555,129 +563,268 @@ describe('createLiveIsland and applyStep', () => {
       handle.dispose();
     }
   });
-});
 
-describe('promote()', () => {
-  function makeForceInput(positions, globalStep = 0) {
-    const topology = {
-      requestId: 1,
-      nodeIds: ['entity-alpha', 'entity-beta'],
-      nodeKinds: ['leaf', 'leaf'],
-      relations: [],
-    };
-    const initialFrame = {
-      requestId: 1,
-      globalStep,
-      positions: new Float32Array(positions),
-    };
-    return {
-      visualPayloadByEntityId: makePayloadMap(),
-      topology,
-      initialFrame,
-      presentation: { occupiedOpacity: 0.5, showSprings: false },
-    };
-  }
-
-  test('promote returns the same handle identity', () => {
+  test('[US1] rejects invalid leafCells frame and centers rendered leaf-Towers on axialToPlane coordinates without assigning cells to Layout Anchors', () => {
     const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
     try {
-      const terminal = { globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) };
-      const promoted = handle.promote(terminal);
-      assert.equal(promoted, handle);
-    } finally {
-      handle.dispose();
-    }
-  });
+      assert.equal(handle.interactiveTiles.length > 0, true);
+      const readyFrame = makeForceFrame(makeForceInput([]).topology, [100, 100, -100, -100], [0, 0, 1, 0], 1);
+      handle.applyStep(readyFrame);
 
-  test('promote sets terminalFrame on the handle', () => {
-    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
-    try {
-      assert.equal(handle.terminalFrame, null);
-      const terminal = { globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) };
-      handle.promote(terminal);
-      assert.equal(handle.terminalFrame, terminal);
-      assert.equal(handle.stable, true);
-    } finally {
-      handle.dispose();
-    }
-  });
-
-  test('applyStep throws after promote', () => {
-    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
-    try {
-      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
-      assert.throws(
-        () => handle.applyStep({ requestId: 1, globalStep: 1, positions: new Float32Array([1, 2, 6, 5]) }),
-        /Island rendering failed./,
-      );
-    } finally {
-      handle.dispose();
-    }
-  });
-
-  test('promote throws when already stable', () => {
-    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
-    try {
-      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
-      assert.throws(
-        () => handle.promote({ globalStep: 2, positions: new Float32Array([0, 0, 5, 3]) }),
-        /Island rendering failed./,
-      );
-    } finally {
-      handle.dispose();
-    }
-  });
-
-  test('promote throws when disposed', () => {
-    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
-    handle.dispose();
-    assert.throws(
-      () => handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) }),
-      /Island rendering failed./,
-    );
-  });
-
-  test('InstancedMesh count, material opacity, and color are unchanged after promote', () => {
-    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
-    try {
       const occupied = handle.interactiveTiles[0];
-      const countBefore = occupied.count;
-      const opacityBefore = occupied.material.opacity;
-      const colorBefore = new THREE.Color();
-      occupied.getColorAt(0, colorBefore);
+      assert.equal(occupied.userData.instances[0].x, Math.fround(axialToPlane(0, 0).x));
+      assert.equal(occupied.userData.instances[1].x, Math.fround(axialToPlane(1, 0).x));
+      const before = handle.inspectCurrentFrame();
 
-      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
-
-      assert.equal(occupied.count, countBefore);
-      assert.equal(occupied.material.opacity, opacityBefore);
-      const colorAfter = new THREE.Color();
-      occupied.getColorAt(0, colorAfter);
-      assert.equal(colorAfter.getHex(), colorBefore.getHex());
+      const invalidFrame = makeForceFrame(makeForceInput([]).topology, [0, 0, 100, 100], [0, 0, 300, 0], 2, 1);
+      assert.throws(() => handle.applyStep(invalidFrame));
+      assert.deepEqual(handle.inspectCurrentFrame(), before);
     } finally {
       handle.dispose();
     }
   });
 
-  test('promote creates no new geometries, materials, or meshes', () => {
-    const input = makeForceInput([0, 0, 5, 3]);
-    input.topology.relations = [{ sourceIndex: 0, targetIndex: 1 }];
-    input.presentation.showSprings = true;
+  test('requires complete assignments and atomically reuses the live grid across revisions', () => {
+    const input = makeForceInput([0, 0, 0, 0]);
     const handle = createLiveIsland(input);
     try {
-      const countChildren = (group) => {
-        let count = 0;
-        group.traverse(() => { count++; });
-        return count;
-      };
-      const childrenBefore = countChildren(handle.root);
-      const tilesBefore = handle.interactiveTiles.length;
+      const emptyGrid = handle.interactiveTiles.find((tile) => tile.userData.isEmpty);
+      const before = handle.inspectCurrentFrame();
+      const malformed = makeForceFrame(input.topology, [10, 10, 20, 20], [0, 0, 1, 0], 1, 1);
+      delete malformed.leafCells;
+      assert.throws(() => handle.applyStep(malformed));
+      assert.deepEqual(handle.inspectCurrentFrame(), before);
 
-      handle.promote({ globalStep: 1, positions: new Float32Array([0, 0, 5, 3]) });
-
-      assert.equal(countChildren(handle.root), childrenBefore);
-      assert.equal(handle.interactiveTiles.length, tilesBefore);
+      handle.applyStep(makeForceFrame(input.topology, [10, 10, 20, 20], [-1, 0, 1, -1], 1, 1));
+      const after = handle.inspectCurrentFrame();
+      assert.strictEqual(handle.interactiveTiles.find((tile) => tile.userData.isEmpty), emptyGrid);
+      assert.deepEqual(after.occupiedCells, ['-1,0', '1,-1']);
+      for (const tower of after.towers) {
+        const center = axialToPlane(tower.q, tower.r);
+        assert.equal(tower.x, Math.fround(center.x));
+        assert.equal(tower.z, Math.fround(center.z));
+      }
+      for (const empty of emptyGrid.userData.instances) {
+        assert.equal(after.occupiedCells.includes(`${empty.q},${empty.r}`), false);
+      }
+      assert.deepEqual(after.resourceCounts, before.resourceCounts);
     } finally {
       handle.dispose();
+    }
+  });
+
+  test('keeps every normal frame Tower, occupancy, revision, and leaf/anchor spring endpoint coherent and rolls malformed input back atomically', () => {
+    const topology = {
+      requestId: 31,
+      nodeIds: ['entity-alpha', 'anchor-root', 'entity-beta'],
+      nodeKinds: ['leaf', 'anchor', 'leaf'],
+      relations: [
+        { sourceIndex: 0, targetIndex: 1 },
+        { sourceIndex: 1, targetIndex: 2 },
+      ],
+    };
+    const frames = [
+      makeForceFrame(topology, [100, 100, 7, -9, -100, -100], [0, 0, 1, 0], 0, 0),
+      makeForceFrame(topology, [101, 101, 8, -8, -101, -101], [-1, 0, 1, -1], 1, 1),
+      makeForceFrame(topology, [102, 102, 9, -7, -102, -102], [-1, 0, 1, -1], 2, 1),
+      makeForceFrame(topology, [103, 103, 10, -6, -103, -103], [-2, 1, 2, -1], 3, 2),
+    ];
+    const handle = createLiveIsland({
+      visualPayloadByEntityId: makePayloadMap(),
+      topology,
+      initialFrame: frames[0],
+      presentation: { occupiedOpacity: 0.5, showSprings: true },
+    });
+
+    const assertCoherent = (frame) => {
+      const displayed = handle.inspectCurrentFrame();
+      assert.equal(displayed.globalStep, frame.globalStep);
+      assert.equal(displayed.assignmentRevision, frame.assignmentRevision);
+      assert.equal(displayed.assignmentHash, frame.assignmentHash);
+      assert.deepEqual(displayed.leafCells, Array.from(frame.leafCells));
+      assert.equal(new Set(displayed.occupiedCells).size, displayed.towers.length);
+      assert.deepEqual(displayed.occupiedCells, displayed.towers.map(({ q, r }) => `${q},${r}`).sort());
+      for (const tower of displayed.towers) {
+        assert.ok(Number.isInteger(tower.q));
+        assert.ok(Number.isInteger(tower.r));
+        const center = axialToPlane(tower.q, tower.r);
+        assert.equal(tower.x, Math.fround(center.x));
+        assert.equal(tower.z, Math.fround(center.z));
+      }
+      const [alpha, beta] = displayed.towers;
+      assert.deepEqual(displayed.springPositions, [
+        alpha.x, 0, alpha.z, frame.positions[2], 0, frame.positions[3],
+        frame.positions[2], 0, frame.positions[3], beta.x, 0, beta.z,
+      ]);
+    };
+
+    try {
+      assertCoherent(frames[0]);
+      for (const frame of frames.slice(1)) {
+        handle.applyStep(frame);
+        assertCoherent(frame);
+      }
+
+      const beforeMalformed = handle.inspectCurrentFrame();
+      const malformed = makeForceFrame(topology, [0, 0, 0, 0, 0, 0], [-3, 1, 3, -1], 4, 3);
+      malformed.assignmentHash += 1;
+      assert.throws(() => handle.applyStep(malformed));
+      assert.deepEqual(handle.inspectCurrentFrame(), beforeMalformed);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('grows live grid capacity repeatedly while reusing geometry/material and disposing each replaced mesh exactly once', () => {
+    const input = makeForceInput([0, 0, 0, 0]);
+    const handle = createLiveIsland(input);
+    const initial = handle.inspectCurrentFrame();
+    const sharedGeometry = handle.interactiveTiles.find((tile) => tile.userData.isEmpty).geometry;
+    const sharedMaterial = handle.interactiveTiles.find((tile) => tile.userData.isEmpty).material;
+    let geometryDisposals = 0;
+    let materialDisposals = 0;
+    const originalGeometryDispose = sharedGeometry.dispose.bind(sharedGeometry);
+    const originalMaterialDispose = sharedMaterial.dispose.bind(sharedMaterial);
+    sharedGeometry.dispose = () => { geometryDisposals += 1; originalGeometryDispose(); };
+    sharedMaterial.dispose = () => { materialDisposals += 1; originalMaterialDispose(); };
+
+    try {
+      let previousCapacity = initial.gridCapacity;
+      for (const [step, radius] of [[1, 4], [2, 8], [3, 16]]) {
+        const oldMesh = handle.interactiveTiles.find((tile) => tile.userData.isEmpty);
+        let removals = 0;
+        let disposals = 0;
+        oldMesh.addEventListener('removed', () => { removals += 1; });
+        const originalDispose = oldMesh.dispose.bind(oldMesh);
+        oldMesh.dispose = () => { disposals += 1; originalDispose(); };
+
+        handle.applyStep(makeForceFrame(input.topology, [0, 0, 0, 0], [-radius, 0, radius, 0], step, step));
+        const currentMesh = handle.interactiveTiles.find((tile) => tile.userData.isEmpty);
+        const diagnostics = handle.inspectCurrentFrame();
+        assert.notStrictEqual(currentMesh, oldMesh);
+        assert.strictEqual(currentMesh.geometry, sharedGeometry);
+        assert.strictEqual(currentMesh.material, sharedMaterial);
+        assert.ok(diagnostics.gridCapacity > previousCapacity);
+        assert.equal(removals, 1);
+        assert.equal(disposals, 1);
+        assert.equal(geometryDisposals, 0);
+        assert.equal(materialDisposals, 0);
+        previousCapacity = diagnostics.gridCapacity;
+      }
+    } finally {
+      handle.dispose();
+    }
+    assert.equal(geometryDisposals, 1);
+    assert.equal(materialDisposals, 1);
+  });
+});
+
+describe('empty cell grid (T011)', () => {
+  test('createIsland includes empty cell grid with correct visibility and minimum radius', () => {
+    const input = makeInput({ gridRadius: 1 });
+    const handle = createIsland(input);
+    try {
+      const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
+      assert.ok(empty, 'empty cell grid is exposed in interactiveTiles');
+      assert.ok(empty instanceof THREE.InstancedMesh);
+      assert.ok(empty.count > 0, 'empty grid has at least one cell');
+
+      for (const material of getMaterials(empty)) {
+        assert.equal(material.opacity, 0.18);
+        assert.equal(material.transparent, true);
+        assert.equal(material.depthWrite, false);
+      }
+
+      for (const instance of empty.userData.instances) {
+        assert.equal(instance.isEmpty, true);
+        assert.equal(typeof instance.q, 'number');
+        assert.equal(typeof instance.r, 'number');
+        assert.equal(typeof instance.x, 'number');
+        assert.equal(typeof instance.z, 'number');
+        assert.equal(instance.depth, 0.05);
+      }
+
+      assert.ok(empty.userData.baseColors.length > 0);
+      assert.ok(Array.isArray(empty.userData.instances));
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('createIsland excludes occupied cells from empty grid', () => {
+    const input = makeInput({ gridRadius: 1 });
+    const handle = createIsland(input);
+    try {
+      const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
+      const occupiedKeys = new Set(input.layoutResult.placements.map((p) => `${p.q},${p.r}`));
+      for (const instance of empty.userData.instances) {
+        assert.ok(!occupiedKeys.has(`${instance.q},${instance.r}`), `occupied cell (${instance.q},${instance.r}) must not appear in empty grid`);
+      }
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('createIsland with gridRadius=0 uses minimum default radius of 3', () => {
+    const input = makeInput({ gridRadius: 0, placements: [] });
+    const emptyPayloadMap = new Map();
+    const emptyInput = {
+      visualPayloadByEntityId: emptyPayloadMap,
+      layoutResult: makeLayoutResult({ placements: [], gridRadius: 0, stats: { occupiedCount: 0, boundaryGaps: [] } }),
+      presentation: { occupiedOpacity: 1, showSprings: false },
+    };
+    const handle = createIsland(emptyInput);
+    try {
+      const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
+      assert.ok(empty, 'empty grid exists for empty scene');
+      assert.ok(empty.count > 0, 'empty grid has cells even with no towers');
+    } finally {
+      handle.dispose();
+    }
+  });
+});
+
+describe('force-mode empty cell grid (T012)', () => {
+  test('createLiveIsland includes empty cell grid in interactiveTiles with correct extent', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    try {
+      assert.equal(handle.interactiveTiles.length, 2);
+      const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
+      assert.ok(empty, 'empty cell grid is present in force-mode interactiveTiles');
+      assert.ok(empty instanceof THREE.InstancedMesh);
+      assert.ok(empty.count > 0, 'force-mode empty grid has cells');
+      assert.equal(empty.userData.isEmpty, true);
+      assert.ok(empty.userData.instances.length > 0);
+      assert.ok(empty.userData.baseColors.length > 0);
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  test('force-mode empty grid is cleaned up on dispose', () => {
+    const handle = createLiveIsland(makeForceInput([0, 0, 5, 3]));
+    const empty = handle.interactiveTiles.find((tile) => tile.userData.isEmpty === true);
+    const geometryDisposals = new Map();
+    const materialDisposals = new Map();
+    const originalGeometryDispose = THREE.BufferGeometry.prototype.dispose;
+    const originalMaterialDispose = THREE.Material.prototype.dispose;
+
+    THREE.BufferGeometry.prototype.dispose = function () {
+      geometryDisposals.set(this, (geometryDisposals.get(this) ?? 0) + 1);
+      return originalGeometryDispose.call(this);
+    };
+    THREE.Material.prototype.dispose = function () {
+      materialDisposals.set(this, (materialDisposals.get(this) ?? 0) + 1);
+      return originalMaterialDispose.call(this);
+    };
+
+    try {
+      handle.dispose();
+      assert.ok(geometryDisposals.size > 0, 'empty grid geometries were disposed');
+      assert.ok(materialDisposals.size > 0, 'empty grid materials were disposed');
+    } finally {
+      THREE.BufferGeometry.prototype.dispose = originalGeometryDispose;
+      THREE.Material.prototype.dispose = originalMaterialDispose;
     }
   });
 });
