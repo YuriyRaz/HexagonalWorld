@@ -304,8 +304,9 @@ function resolveAssignments(leafNodes, config, candidateOffsets, storage) {
     const predictedR = quantize(predicted.r, config.decisionQuantizationStep);
     // Search around the current assignment. Using the predicted world position
     // as the lattice origin lets mobile anchors drag assignments indefinitely.
-    const originQ = node.assignedQ;
-    const originR = node.assignedR;
+    const originAxial = node.controlFx !== null ? planeToAxial(node.fx, node.fy) : null;
+    const originQ = originAxial ? Math.round(originAxial.q) : node.assignedQ;
+    const originR = originAxial ? Math.round(originAxial.r) : node.assignedR;
     const start = leafIndex * candidateCapacity;
     let count = 0;
     for (const offset of candidateOffsets) {
@@ -791,7 +792,7 @@ export function createForceLayoutSession(request) {
       }
       session.state.processedCommandSeq = command.commandSeq;
       const leaf = leafNodes.find((node) => node.entityId === command.entityId);
-      const eligible = ['settled', 'held', 'cooling'].includes(session.state.phase);
+      const eligible = ['running', 'center-locking', 'settled', 'held', 'cooling'].includes(session.state.phase);
       const semanticReject = (code, details = {}) => ({
         accepted: false,
         requestId: session.requestId,
@@ -913,7 +914,7 @@ export function createForceLayoutSession(request) {
       const alpha = Math.max(alphaSchedule.minimum, alphaSchedule.initial * Math.pow(1 - alphaSchedule.decay, session.state.coolingStep));
       session.state.alpha = isHeld ? Math.max(alphaSchedule.minimum, alpha) : alpha;
       session.simulation.alpha(session.state.alpha);
-      if (!session.assignmentFrozen && !isHeld && session.state.coolingStep % session.config.assignmentInterval === 0) {
+      if (!session.assignmentFrozen && session.state.coolingStep % session.config.assignmentInterval === 0) {
         const assignment = resolveAssignments(
           session.leafNodes,
           session.config,

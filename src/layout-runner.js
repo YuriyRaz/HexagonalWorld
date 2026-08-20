@@ -309,8 +309,9 @@ export function createLayoutRunner({
           state.terminalPositionBuffer = response.terminalFrame?.positions?.buffer || null;
           state.terminalCellBuffer = response.terminalFrame?.leafCells?.buffer || null;
           state.terminalEpoch = response.epoch ?? 0;
+          const isInitial = !state.hasSettlement;
           state.hasSettlement = true;
-          state.phase = response.type === 'success' ? 'settled-awaiting-commit' : 'epoch-awaiting-commit';
+          state.phase = isInitial ? 'settled-awaiting-commit' : 'epoch-awaiting-commit';
           const settlement = Object.freeze({
             requestId: state.requestId,
             epoch: response.epoch ?? 0,
@@ -320,13 +321,13 @@ export function createLayoutRunner({
             terminalFrame: structuredClone(response.terminalFrame),
           });
           try {
-            if (response.type === 'success') state.options.onInitialSettled?.(settlement);
+            if (isInitial) state.options.onInitialSettled?.(settlement);
             else state.options.onEpochSettled?.(settlement);
           } catch {
             fail('PRESENTATION_FAILED', { reason: 'settlement-observer' });
             return;
           }
-          if (response.type === 'success') resolve(response.result);
+          if (isInitial) resolve(response.result);
           else {
             const waiter = state.epochWaiters.get(response.epoch);
             state.epochWaiters.delete(response.epoch);
@@ -519,7 +520,7 @@ export function createLayoutRunner({
     const state = activeState;
     if (!state || state.kind !== 'v2') return Promise.reject(createRunnerError('SESSION_UNAVAILABLE', input?.requestId, {}));
     if (input?.requestId !== state.requestId) return Promise.reject(createRunnerError('STALE_REQUEST', input?.requestId, {}));
-    if (!['retained-settled', 'held', 'interaction-cooling'].includes(state.phase)) {
+    if (!['running', 'center-locking', 'retained-settled', 'held', 'interaction-cooling', 'epoch-awaiting-commit', 'settled-awaiting-commit', 'waiting-for-paint', 'starting'].includes(state.phase)) {
       return Promise.reject(createRunnerError('SESSION_NOT_SETTLED', state.requestId, { phase: state.phase }));
     }
     if (!input || (input.action !== 'set-fixed-position' && input.action !== 'release-fixed-position') || typeof input.entityId !== 'string') {
@@ -599,11 +600,29 @@ export function createLayoutRunner({
     cancelActiveLayout('disposed');
   }
 
+  function dragStart(requestId, entityId, x, z) {
+    return submitForceControl({ requestId, action: 'set-fixed-position', entityId, x, y: z });
+  }
+
+  function dragMove(requestId, entityId, x, z) {
+    return submitForceControl({ requestId, action: 'set-fixed-position', entityId, x, y: z });
+  }
+
+  function dragEnd(requestId, entityId, unpin = true) {
+    if (unpin) {
+      return submitForceControl({ requestId, action: 'release-fixed-position', entityId });
+    }
+    return Promise.resolve(null);
+  }
+
   return {
     runLayout,
     cancelActiveLayout,
     confirmSessionResultCommitted,
     submitForceControl,
+    dragStart,
+    dragMove,
+    dragEnd,
     waitForEpochSettlement,
     setPresentationPaused,
     suppressActivePresentation,
@@ -698,9 +717,14 @@ function validatePresentedFrameSequence(frame, state, type) {
   if (frame.globalStep !== state.lastGlobalStep + 1) throw new Error('non-contiguous global step');
   if (frame.epoch < state.lastEpoch || frame.epoch > state.lastEpoch + 1) throw new Error('invalid epoch sequence');
   const retainedTransition = frame.epoch === state.lastEpoch + 1;
-  if (retainedTransition
-    && (state.phase !== 'retained-settled' || state.committedEpoch !== state.lastEpoch || frame.epochStep !== 1)) {
-    throw new Error('invalid retained epoch transition');
+  if (retainedTransition) {
+    const isControlTransition = state.phase === 'held' || state.phase === 'interaction-cooling' || state.controlWaiters.size > 0;
+    if (!isControlTransition && (state.phase !== 'retained-settled' || state.committedEpoch !== state.lastEpoch || frame.epochStep !== 1)) {
+      throw new Error('invalid retained epoch transition');
+    }
+    if (isControlTransition && frame.epochStep !== 1) {
+      throw new Error('invalid retained epoch transition step');
+    }
   }
   if (state.lastTerminal !== 'none' && !retainedTransition) throw new Error('step after terminal frame');
   validateAssignmentSequence(frame, state);
@@ -713,14 +737,18 @@ function validateSettlementSequence(response, state) {
     || response.epoch !== frame.epoch || response.globalStep !== frame.globalStep) {
     throw new Error('settlement identity mismatch');
   }
-  if (response.type === 'success') {
-    if (state.hasSettlement || response.epoch !== 0) throw new Error('invalid initial settlement');
-  } else if (!state.hasSettlement || response.epoch !== state.terminalEpoch + 1) {
-    throw new Error('invalid epoch settlement');
+  if (!state.hasSettlement) {
+    if (response.epoch < 0) throw new Error('invalid initial settlement');
+  } else if (response.epoch !== state.terminalEpoch + 1) {
+    // If the session was already settled but we received an epoch success, epoch must match terminalEpoch + 1
+    // Exception: if the epoch was incremented because we dragged, we allow it
+    if (response.epoch !== state.lastEpoch) {
+      throw new Error('invalid epoch settlement');
+    }
   }
 
   if (state.presentation === 'all-steps') {
-    if (state.lastGlobalStep === null || state.lastTerminal !== 'converged'
+    if (state.lastGlobalStep === null || frame.terminal !== 'converged'
       || frame.globalStep !== state.lastGlobalStep || frame.epoch !== state.lastEpoch
       || frame.epochStep !== state.lastEpochStep || frame.assignmentRevision !== state.lastAssignmentRevision
       || frame.assignmentHash !== state.lastAssignmentHash || !equalLeafCells(frame.leafCells, state.lastLeafCells)) {

@@ -102,6 +102,7 @@ function createWorkerController(
     if (active !== state || state.scheduled !== null) return;
     try {
       const frame = state.session.advanceOneStep();
+      state.epoch = frame.epoch;
       sendFrame(state, frame, 'step');
     } catch (error) {
       state.session.dispose();
@@ -244,7 +245,7 @@ function createWorkerController(
       return;
     }
     if (message.type === 'force-control') {
-      if (!['retained-settled', 'held', 'cooling'].includes(state.phase)) {
+      if (!['running', 'center-locking', 'retained-settled', 'held', 'cooling', 'settled-awaiting-commit'].includes(state.phase)) {
         post(postMessage, {
           type: 'force-control-result',
           requestId: state.requestId,
