@@ -48,6 +48,17 @@ button, a { -webkit-tap-highlight-color: transparent; }
   height: 100%;
   outline: none;
   cursor: grab;
+  touch-action: none;
+}
+
+body.is-dragging,
+body.is-dragging * {
+  pointer-events: none !important;
+}
+
+body.is-dragging #world {
+  pointer-events: auto !important;
+  cursor: grabbing !important;
 }
 
 #world:active { cursor: grabbing; }
@@ -94,6 +105,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
   font-size: 9px;
   font-weight: 700;
   letter-spacing: .18em;
+  pointer-events: none !important;
 }
 
 .world-state__dot {
@@ -185,7 +197,14 @@ h1 em { color: var(--lime); font-style: normal; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
-  pointer-events: auto;
+  pointer-events: none !important;
+}
+
+.generator-form input,
+.generator-form select,
+.generator-form button,
+.generate-button {
+  pointer-events: auto !important;
 }
 
 .generator-form[aria-busy="true"] {
@@ -306,6 +325,14 @@ h1 em { color: var(--lime); font-style: normal; }
 .generate-button:focus-visible { outline: 2px solid var(--lime); outline-offset: 2px; }
 .generate-button svg { width: 17px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 
+:not(.is-dragging) .brand,
+:not(.is-dragging) .icon-button,
+:not(.is-dragging) .generator-form input,
+:not(.is-dragging) .generator-form select,
+:not(.is-dragging) .generate-button {
+  pointer-events: auto !important;
+}
+
 .selection {
   margin-top: 16px;
   padding: 13px;
@@ -327,17 +354,9 @@ h1 em { color: var(--lime); font-style: normal; }
 .selection strong { overflow: hidden; color: #eff5ef; font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .selection small { color: var(--muted); font-size: 8px; letter-spacing: .05em; }
 
-.height-scale {
-  position: absolute;
-  z-index: 4;
-  top: 152px;
-  right: 47px;
-  display: grid;
-  grid-template-columns: auto 4px auto;
-  gap: 10px;
-  height: 180px;
-  pointer-events: none;
-}
+.height-scale, .height-scale * { pointer-events: none; }
+.compass, .compass * { pointer-events: none; }
+.controls-help, .controls-help * { pointer-events: none; }
 
 .height-scale > span { writing-mode: vertical-rl; transform: rotate(180deg); color: rgba(230, 241, 231, .4); font-size: 7px; font-weight: 700; letter-spacing: .25em; }
 .height-scale__bar { width: 3px; height: 100%; background: linear-gradient(#e8f2bc, #91b86a 33%, #3d8a6b 66%, #244f4b); position: relative; }
@@ -368,7 +387,7 @@ h1 em { color: var(--lime); font-style: normal; }
 .compass__dial i:nth-child(4) { left: 4px; top: 29px; }
 .compass__dial b { position: absolute; width: 0; height: 0; top: 8px; left: 25px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 16px solid var(--lime); filter: drop-shadow(0 0 4px rgba(185, 220, 120, .5)); }
 
-.controls-help {
+.controls-help, .controls-help * {
   position: absolute;
   z-index: 4;
   left: 50%;
@@ -377,7 +396,7 @@ h1 em { color: var(--lime); font-style: normal; }
   display: flex;
   align-items: center;
   gap: 30px;
-  pointer-events: none;
+  pointer-events: none !important;
 }
 
 .controls-help > div { display: flex; align-items: center; gap: 8px; }
@@ -452,4 +471,14 @@ h1 em { color: var(--lime); font-style: normal; }
 
 .layout-status.is-error {
   color: #e07a5f;
+}
+
+body.is-dragging,
+body.is-dragging * {
+  pointer-events: none !important;
+}
+
+body.is-dragging #world {
+  pointer-events: auto !important;
+  cursor: grabbing !important;
 }

@@ -286,6 +286,13 @@ let forcePresentationActive = false;
 let particles = null;
 
 window.__hexWorldTest = {
+  camera,
+  THREE,
+  getTiles: () => tiles,
+  getDragDebugState: () => ({
+    dragPending: dragPending ? { ...dragPending } : null,
+    activeDragSession: activeDragSession ? { ...activeDragSession } : null,
+  }),
   configureNextRequest: (config) => {
     window.__hexWorldTest.nextConfig = config;
   },
@@ -412,14 +419,23 @@ function updateForceProgress(frame, terminalReason = null) {
 
 function paintReceipt(frame) {
   return new Promise((resolve) => {
-    requestAnimationFrame(() => {
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
       resolve({
         requestId: frame.requestId,
         globalStep: frame.globalStep,
         positionBuffer: frame.positions.buffer,
         cellBuffer: frame.leafCells.buffer,
       });
-    });
+    };
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      setTimeout(done, 0);
+    } else {
+      requestAnimationFrame(done);
+      setTimeout(done, 32);
+    }
   });
 }
 
@@ -466,7 +482,37 @@ function captureForceTrace(frame, topology) {
 
 async function commitEpochSettlement(settlement) {
   if (settlement.requestId !== requestIdCounter) throw Object.assign(new Error('Stale settlement.'), { code: 'CANCELLED' });
-  let candidate = activeLiveIslandHandle;
+  if (!initialSettlement) {
+    initialSettlement = settlement;
+  }
+  layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
+  let candidate = activeLiveIslandHandle || activeIslandHandle;
+  if (candidate && settlement.result?.towerPositions) {
+    const occupied = candidate.interactiveTiles?.find(t => !t.userData.isEmpty);
+    if (occupied && occupied.userData.instances) {
+      const matrix = new THREE.Matrix4();
+      const position = new THREE.Vector3();
+      const scale = new THREE.Vector3();
+      const rotation = new THREE.Quaternion();
+
+      occupied.userData.instances.forEach((inst, index) => {
+        const entityId = inst.entityId || inst.payload?.entityId;
+        const pos = settlement.result?.towerPositions?.[entityId];
+        if (pos) {
+          const depth = inst.height + 1.4;
+          const y = inst.height / 2 - 0.62;
+          inst.x = pos.x;
+          inst.z = pos.z;
+          position.set(pos.x, y, pos.z);
+          scale.set(1, depth, 1);
+          matrix.compose(position, rotation, scale);
+          occupied.setMatrixAt(index, matrix);
+        }
+      });
+      occupied.instanceMatrix.needsUpdate = true;
+      occupied.computeBoundingSphere();
+    }
+  }
   if (!candidate) {
     candidate = createIsland({
       visualPayloadByEntityId: activeVisualPayloadByEntityId,
@@ -488,7 +534,6 @@ async function commitEpochSettlement(settlement) {
   activeLayoutResult = settlement.result;
   tiles = candidate.interactiveTiles;
   if (previous && previous !== candidate) previous.dispose();
-  layoutRunner.confirmSessionResultCommitted(settlement.requestId, settlement.epoch);
 }
 
 if (new URLSearchParams(location.search).has('testDiagnostics')) {
@@ -654,14 +699,15 @@ async function rebuildIsland() {
         onStep: (frame) => {
           if (currentRequestId !== requestIdCounter) return paintReceipt(frame);
           workerMessageCount++;
-          activeLiveIslandHandle?.applyStep(frame);
+          const activeHandle = activeLiveIslandHandle || activeIslandHandle;
+          activeHandle?.applyStep(frame);
           interactionDirty = true;
           updateForceProgress(frame);
           captureForceTrace(frame, activeTopology);
           if (frame.terminal === 'converged') {
             if (convergedStep === null) convergedStep = frame.globalStep;
             if (statusEl) {
-              const springCount = activeLiveIslandHandle?.root.children.find(c => c instanceof THREE.LineSegments)?.geometry.getAttribute('position').count / 2 ?? 0;
+              const springCount = activeHandle?.root.children.find(c => c instanceof THREE.LineSegments)?.geometry.getAttribute('position').count / 2 ?? 0;
               statusEl.textContent = `Раскладка сошлась на шаге ${convergedStep}. Активных связей: ${springCount}.`;
               canvas.setAttribute('aria-label', `Интерактивная трехмерная карта острова. Силовая раскладка. Активных связей: ${springCount}. Башни полупрозрачные.`);
             }
@@ -676,8 +722,8 @@ async function rebuildIsland() {
           if (currentRequestId !== requestIdCounter) return paintReceipt(frame);
           convergedStep = null;
           workerMessageCount++;
-          activeLiveIslandHandle = activeIslandHandle;
-          activeLiveIslandHandle.applyStep(frame);
+          activeLiveIslandHandle = activeLiveIslandHandle || activeIslandHandle;
+          activeLiveIslandHandle?.applyStep(frame);
           tiles = activeLiveIslandHandle.interactiveTiles;
           restoreSelectionByEntityId(activeLiveIslandHandle.interactiveTiles);
           interactionDirty = true;
@@ -691,6 +737,16 @@ async function rebuildIsland() {
           initialSettlement = settlement;
           activeTopology = settlement.topology;
           validatedResultAt = performance.now();
+          if (statusEl) {
+            statusEl.textContent = `Раскладка сошлась на шаге ${settlement.globalStep}.`;
+          }
+        },
+        onEpochSettled: (settlement) => {
+          if (currentRequestId !== requestIdCounter) return;
+          commitEpochSettlement(settlement);
+          if (statusEl) {
+            statusEl.textContent = `Раскладка сошлась на шаге ${settlement.globalStep}.`;
+          }
         },
       } : undefined);
     }
@@ -712,7 +768,7 @@ async function rebuildIsland() {
           presentation,
         });
       } else {
-        candidateHandle = activeLiveIslandHandle;
+        candidateHandle = activeLiveIslandHandle || activeIslandHandle;
       }
       if (!candidateHandle) throw Object.assign(new Error('Missing force candidate.'), { code: 'RENDER_FAILED', details: { reason: 'missing-force-candidate' } });
       if (nextCommitOutcome === 'failure') {
@@ -730,7 +786,10 @@ async function rebuildIsland() {
       waterRings = [];
       if (initialSettlement) layoutRunner.confirmSessionResultCommitted(currentRequestId, initialSettlement.epoch);
       if (initialSettlement) pendingAlignedRequestId = currentRequestId;
-      if (initialSettlement && presentationMode === 'final-only') captureForceTrace(initialSettlement.terminalFrame, initialSettlement.topology);
+      if (initialSettlement && presentationMode === 'final-only') {
+        captureForceTrace(initialSettlement.terminalFrame, initialSettlement.topology);
+        if (statusEl) statusEl.textContent = `Раскладка сошлась на шаге ${initialSettlement.globalStep}.`;
+      }
       if (previousActiveHandle && previousActiveHandle !== activeIslandHandle) {
         world.remove(previousActiveHandle.root);
         previousActiveHandle.dispose();
@@ -909,6 +968,92 @@ const selectedColor = new THREE.Color(0xffffff);
 let pointerDown = null;
 let cameraTween = null;
 
+const dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const dragIntersection = new THREE.Vector3();
+let dragPending = null;
+let activeDragSession = null;
+
+let isDragControlInFlight = false;
+let pendingDragMovePos = null;
+let dragControlInFlightTimer = null;
+
+function setInFlight(flag) {
+  isDragControlInFlight = flag;
+  if (dragControlInFlightTimer) {
+    clearTimeout(dragControlInFlightTimer);
+    dragControlInFlightTimer = null;
+  }
+  if (flag) {
+    dragControlInFlightTimer = setTimeout(() => {
+      isDragControlInFlight = false;
+      dragControlInFlightTimer = null;
+    }, 500);
+  }
+}
+
+function sendDragMove(entityId, x, z) {
+  pendingDragMovePos = { x, z };
+  if (isDragControlInFlight) return;
+  processNextDragMove(entityId);
+}
+
+function processNextDragMove(entityId) {
+  if (!pendingDragMovePos || isDragControlInFlight) return;
+  const target = pendingDragMovePos;
+  pendingDragMovePos = null;
+  setInFlight(true);
+
+  if (algorithmSelect.value === 'force-anchors' && layoutRunner) {
+    layoutRunner.dragMove(requestIdCounter, entityId, target.x, target.z)
+      .catch(() => {})
+      .finally(() => {
+        setInFlight(false);
+        if (pendingDragMovePos) {
+          processNextDragMove(entityId);
+        }
+      });
+  } else {
+    setInFlight(false);
+  }
+}
+
+function sendDragEnd(entityId) {
+  pendingDragMovePos = null;
+  let retries = 0;
+
+  function doRelease() {
+    if ((isDragControlInFlight || pendingDragMovePos) && retries < 15) {
+      retries += 1;
+      setTimeout(doRelease, 15);
+      return;
+    }
+    setInFlight(true);
+    if (algorithmSelect.value === 'force-anchors' && layoutRunner) {
+      layoutRunner.dragEnd(requestIdCounter, entityId, true)
+        .catch(() => {})
+        .finally(() => {
+          setInFlight(false);
+        });
+    } else {
+      setInFlight(false);
+    }
+  }
+
+  doRelease();
+}
+
+function cancelActiveDrag() {
+  if (activeDragSession) {
+    sendDragEnd(activeDragSession.entityId);
+    activeDragSession = null;
+    window.__hexWorldActiveDragEntityId = null;
+    document.body.classList.remove('is-dragging');
+    controls.enabled = true;
+    canvas.style.cursor = hoveredTile ? 'pointer' : 'grab';
+  }
+  dragPending = null;
+}
+
 function isSameTile(first, second) {
   return first?.object === second?.object && first?.instanceId === second?.instanceId;
 }
@@ -929,7 +1074,8 @@ function setTileState(tile) {
   }
 
   const data = object.userData.instances[instanceId];
-  const stateScale = isSelected ? 1.035 : isHovered ? 1.018 : 1;
+  const isDraggingThisTile = activeDragSession && activeDragSession.entityId === data?.payload?.entityId;
+  const stateScale = isDraggingThisTile ? 1.05 : (isSelected ? 1.035 : isHovered ? 1.018 : 1);
   tilePosition.set(data.x, data.y, data.z);
   tileScale.set(stateScale, data.depth * stateScale, stateScale);
   tileMatrix.compose(tilePosition, tileRotation, tileScale);
@@ -937,7 +1083,8 @@ function setTileState(tile) {
   object.instanceMatrix.needsUpdate = true;
 
   tileColor.fromArray(object.userData.baseColors, instanceId * 3);
-  if (isSelected) tileColor.lerp(selectedColor, 0.8);
+  if (isDraggingThisTile) tileColor.lerp(selectedColor, 0.9);
+  else if (isSelected) tileColor.lerp(selectedColor, 0.8);
   else if (isHovered) tileColor.lerp(hoverColor, 0.85);
   object.setColorAt(instanceId, tileColor);
   object.instanceColor.needsUpdate = true;
@@ -958,7 +1105,11 @@ function updateHover() {
   hoveredTile = hit;
   setTileState(previous);
   setTileState(hoveredTile);
-  canvas.style.cursor = hoveredTile ? 'pointer' : 'grab';
+  if (activeDragSession) {
+    canvas.style.cursor = 'grabbing';
+  } else {
+    canvas.style.cursor = hoveredTile ? 'pointer' : 'grab';
+  }
 }
 
 function selectTile(tile) {
@@ -988,28 +1139,152 @@ function selectTile(tile) {
   }
 }
 
-canvas.addEventListener('pointermove', (event) => {
+window.addEventListener('pointermove', (event) => {
   pointer.x = (event.clientX / innerWidth) * 2 - 1;
   pointer.y = -(event.clientY / innerHeight) * 2 + 1;
   interactionDirty = true;
+
+  if (dragPending && !activeDragSession) {
+    const movement = Math.hypot(event.clientX - dragPending.startScreenX, event.clientY - dragPending.startScreenY);
+    if (movement >= 3) {
+      activeDragSession = {
+        entityId: dragPending.entityId,
+        startWorldPos: dragPending.startWorldPos.clone(),
+        plane: new THREE.Plane(new THREE.Vector3(0, 1, 0), -dragPending.startWorldPos.y),
+      };
+      window.__hexWorldActiveDragEntityId = activeDragSession.entityId;
+      document.body.classList.add('is-dragging');
+      controls.enabled = false;
+      canvas.style.cursor = 'grabbing';
+      const localX = dragPending.startWorldPos.x - world.position.x;
+      const localZ = dragPending.startWorldPos.z - world.position.z;
+      if (algorithmSelect.value !== 'force-anchors') {
+        algorithmSelect.value = 'force-anchors';
+        rebuildIsland().then(() => {
+          if (activeDragSession && layoutRunner) {
+            isDragControlInFlight = true;
+            layoutRunner.dragStart(requestIdCounter, activeDragSession.entityId, localX, localZ)
+              .catch(() => {})
+              .finally(() => {
+                isDragControlInFlight = false;
+                if (pendingDragMovePos && activeDragSession) {
+                  processNextDragMove(activeDragSession.entityId);
+                }
+              });
+          }
+        });
+      } else if (layoutRunner) {
+        isDragControlInFlight = true;
+        layoutRunner.dragStart(requestIdCounter, activeDragSession.entityId, localX, localZ)
+          .catch(() => {})
+          .finally(() => {
+            isDragControlInFlight = false;
+            if (pendingDragMovePos && activeDragSession) {
+              processNextDragMove(activeDragSession.entityId);
+            }
+          });
+      }
+    }
+  }
+
+  if (activeDragSession) {
+    raycaster.setFromCamera(pointer, camera);
+    if (!raycaster.ray.intersectPlane(activeDragSession.plane, dragIntersection)) {
+      camera.getWorldDirection(cameraDirection);
+      const camPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(cameraDirection, activeDragSession.startWorldPos);
+      raycaster.ray.intersectPlane(camPlane, dragIntersection);
+    }
+    const localX = dragIntersection.x - world.position.x;
+    const localZ = dragIntersection.z - world.position.z;
+    sendDragMove(activeDragSession.entityId, localX, localZ);
+  }
 });
 
 canvas.addEventListener('pointerleave', () => {
-  pointer.set(2, 2);
-  const previous = hoveredTile;
-  hoveredTile = null;
-  setTileState(previous);
+  if (!activeDragSession) {
+    pointer.set(2, 2);
+    const previous = hoveredTile;
+    hoveredTile = null;
+    setTileState(previous);
+  }
 });
 
 canvas.addEventListener('pointerdown', (event) => {
-  pointerDown = { x: event.clientX, y: event.clientY, button: event.button };
+  if (event.button !== 0) return;
+
+  pointer.x = (event.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(event.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const intersection = raycaster.intersectObjects(tiles, false)[0];
+  if (intersection) {
+    const hitTile = { object: intersection.object, instanceId: intersection.instanceId ?? null };
+    const entityId = getEntityIdFromTile(hitTile);
+    if (entityId) {
+      controls.enabled = false;
+      pointerDown = { x: event.clientX, y: event.clientY, button: event.button };
+      dragPending = {
+        entityId,
+        startScreenX: event.clientX,
+        startScreenY: event.clientY,
+        startWorldPos: intersection.point.clone(),
+      };
+    }
+  }
 });
 
-canvas.addEventListener('pointerup', (event) => {
-  if (!pointerDown || pointerDown.button !== 0) return;
-  const movement = Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y);
-  if (movement < 5 && hoveredTile) selectTile(hoveredTile);
+function handlePointerUpOrCancel(event) {
+  if (activeDragSession) {
+    sendDragEnd(activeDragSession.entityId);
+    activeDragSession = null;
+    window.__hexWorldActiveDragEntityId = null;
+    document.body.classList.remove('is-dragging');
+    controls.enabled = true;
+    canvas.style.cursor = hoveredTile ? 'pointer' : 'grab';
+  } else if (pointerDown && pointerDown.button === 0 && event.type === 'pointerup') {
+    const movement = Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y);
+    if (movement < 5 && hoveredTile) selectTile(hoveredTile);
+  }
+  window.__hexWorldActiveDragEntityId = null;
+  document.body.classList.remove('is-dragging');
+  controls.enabled = true;
   pointerDown = null;
+  dragPending = null;
+}
+
+window.addEventListener('pointerup', handlePointerUpOrCancel);
+window.addEventListener('pointercancel', handlePointerUpOrCancel);
+window.addEventListener('blur', cancelActiveDrag);
+
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    cancelActiveDrag();
+    return;
+  }
+
+  if (selectedTile && !activeDragSession && event.key.startsWith('Arrow')) {
+    const entityId = getEntityIdFromTile(selectedTile);
+    if (entityId) {
+      const data = selectedTile.object?.userData?.instances?.[selectedTile.instanceId];
+      if (data) {
+        const step = event.shiftKey ? 1.0 : 0.4;
+        let dx = 0;
+        let dz = 0;
+        if (event.key === 'ArrowUp') dz = -step;
+        if (event.key === 'ArrowDown') dz = step;
+        if (event.key === 'ArrowLeft') dx = -step;
+        if (event.key === 'ArrowRight') dx = step;
+        if (dx !== 0 || dz !== 0) {
+          event.preventDefault();
+          const targetX = data.x + dx;
+          const targetZ = data.z + dz;
+          if (algorithmSelect.value === 'force-anchors' && layoutRunner) {
+            layoutRunner.dragStart(requestIdCounter, entityId, targetX, targetZ);
+            layoutRunner.dragEnd(requestIdCounter, entityId, true);
+          }
+        }
+      }
+    }
+  }
 });
 
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());

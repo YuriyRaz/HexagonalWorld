@@ -463,6 +463,8 @@ function createForceFrameScratch(topology, leafCount) {
   return {
     x: new Float32Array(leafCount),
     z: new Float32Array(leafCount),
+    physX: new Float32Array(leafCount),
+    physZ: new Float32Array(leafCount),
     q: new Int16Array(leafCount),
     r: new Int16Array(leafCount),
     springPositions: new Float32Array(topology.relations.length * 6),
@@ -495,10 +497,14 @@ function validateForceFrame(topology, topologyInfo, frame, expectedGlobalStep, s
     if (scratch.cellIndexes.has(cellIndex)) failValidation('DUPLICATE_LEAF_CELL', { entityId: topologyInfo.leafIds[index] });
     scratch.cellIndexes.add(cellIndex);
     const center = axialToPlane(q, r);
+    const nodeIndex = topologyInfo.leafIndices[index];
     scratch.q[index] = q;
     scratch.r[index] = r;
-    scratch.x[index] = center.x;
-    scratch.z[index] = center.z;
+    scratch.physX[index] = frame.positions[nodeIndex * 2];
+    scratch.physZ[index] = frame.positions[nodeIndex * 2 + 1];
+    const isDragged = typeof window !== 'undefined' && window.__hexWorldActiveDragEntityId === topologyInfo.leafIds[index];
+    scratch.x[index] = isDragged ? scratch.physX[index] : center.x;
+    scratch.z[index] = isDragged ? scratch.physZ[index] : center.z;
     scratch.gridRadius = Math.max(scratch.gridRadius, radius);
   }
 
@@ -506,11 +512,10 @@ function validateForceFrame(topology, topologyInfo, frame, expectedGlobalStep, s
     const relation = topology.relations[index];
     for (let endpoint = 0; endpoint < 2; endpoint += 1) {
       const nodeIndex = endpoint === 0 ? relation.sourceIndex : relation.targetIndex;
-      const leafOrdinal = topologyInfo.leafOrdinalByNode[nodeIndex];
       const offset = index * 6 + endpoint * 3;
-      scratch.springPositions[offset] = leafOrdinal >= 0 ? scratch.x[leafOrdinal] : frame.positions[nodeIndex * 2];
+      scratch.springPositions[offset] = frame.positions[nodeIndex * 2];
       scratch.springPositions[offset + 1] = 0;
-      scratch.springPositions[offset + 2] = leafOrdinal >= 0 ? scratch.z[leafOrdinal] : frame.positions[nodeIndex * 2 + 1];
+      scratch.springPositions[offset + 2] = frame.positions[nodeIndex * 2 + 1];
     }
   }
   return scratch;
@@ -591,6 +596,7 @@ function createForceIsland(input, stable) {
       color.toArray(baseColors, index * 3);
     }
     occupiedTiles.userData = { instances, baseColors, nodeIndices: topologyInfo.leafIndices };
+    occupiedTiles.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1000);
     occupiedTiles.castShadow = topologyInfo.leafIds.length <= 2500;
     occupiedTiles.receiveShadow = true;
     occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -667,31 +673,39 @@ function createForceIsland(input, stable) {
       const assignmentsChanged = preparedFrame.assignmentRevision !== currentAssignmentRevision;
       if (!assignmentsChanged && preparedFrame.assignmentHash !== currentAssignmentHash) failValidation('ASSIGNMENT_REVISION_MISMATCH');
       if (preparedFrame.assignmentRevision < currentAssignmentRevision) failValidation('STALE_ASSIGNMENT_REVISION');
+      
+      for (let index = 0; index < instances.length; index += 1) {
+        const record = instances[index];
+        const q = prepared.q[index];
+        const r = prepared.r[index];
+        const x = prepared.x[index];
+        const z = prepared.z[index];
+        const physX = prepared.physX[index];
+        const physZ = prepared.physZ[index];
+        const depth = record.height + 1.4;
+        const y = record.height / 2 - 0.62;
+        const isDragged = typeof window !== 'undefined' && window.__hexWorldActiveDragEntityId === record.entityId;
+        const renderX = isDragged ? physX : x;
+        const renderZ = isDragged ? physZ : z;
+        position.set(renderX, y, renderZ);
+        scale.set(1, depth, 1);
+        matrix.compose(position, rotation, scale);
+        occupiedTiles.setMatrixAt(index, matrix);
+        Object.assign(record, { q, r, x, y, z, depth });
+        worldSize = Math.max(worldSize, Math.hypot(renderX, renderZ) + HEX_SIZE * 2);
+      }
+      occupiedTiles.instanceMatrix.needsUpdate = true;
+      if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
+
       if (assignmentsChanged) {
         occupiedCells.clear();
         for (let index = 0; index < instances.length; index += 1) {
-          const record = instances[index];
-          const q = prepared.q[index];
-          const r = prepared.r[index];
-          const x = prepared.x[index];
-          const z = prepared.z[index];
-          const depth = record.height + 1.4;
-          const y = record.height / 2 - 0.62;
-          position.set(x, y, z);
-          scale.set(1, depth, 1);
-          matrix.compose(position, rotation, scale);
-          occupiedTiles.setMatrixAt(index, matrix);
-          Object.assign(record, { q, r, x, y, z, depth });
-          occupiedCells.add(`${q},${r}`);
-          worldSize = Math.max(worldSize, Math.hypot(x, z) + HEX_SIZE * 2);
+          occupiedCells.add(`${prepared.q[index]},${prepared.r[index]}`);
         }
         currentLeafCells.set(preparedFrame.leafCells);
         currentAssignmentRevision = preparedFrame.assignmentRevision;
         currentAssignmentHash = preparedFrame.assignmentHash;
         gridRadius = prepared.gridRadius;
-        occupiedTiles.instanceMatrix.needsUpdate = true;
-        if (occupiedTiles.instanceColor) occupiedTiles.instanceColor.needsUpdate = true;
-        occupiedTiles.computeBoundingSphere();
         updateEmptyGrid();
       }
       if (springs) {
@@ -712,7 +726,8 @@ function createForceIsland(input, stable) {
       get leafCells() { return currentLeafCells; },
       applyStep(nextFrame) {
         if (retired) throw renderFailure('RETIRED_ISLAND');
-        validateForceFrame(topology, topologyInfo, nextFrame, lastGlobalStep + 1, scratch);
+        const expectedStep = nextFrame.globalStep <= lastGlobalStep ? null : lastGlobalStep + 1;
+        validateForceFrame(topology, topologyInfo, nextFrame, expectedStep, scratch);
         commitPreparedFrame(nextFrame, scratch);
         lastGlobalStep = nextFrame.globalStep;
       },
@@ -851,7 +866,7 @@ export function createIsland(input) {
     occupiedTiles.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     occupiedTiles.instanceColor?.setUsage(THREE.DynamicDrawUsage);
     occupiedTiles.userData = { instances, baseColors };
-    occupiedTiles.computeBoundingSphere();
+    occupiedTiles.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1000);
     root.add(occupiedTiles);
     interactiveTiles.push(occupiedTiles);
 
