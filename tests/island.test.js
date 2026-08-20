@@ -533,6 +533,15 @@ describe('createLiveIsland and applyStep', () => {
       assert.ok(occupied.boundingSphere.radius > 0);
       assert.equal(occupied.userData.instances[0].x, Math.fround(axialToPlane(1, 0).x));
       assert.equal(occupied.userData.instances[1].x, Math.fround(axialToPlane(2, 0).x));
+
+      // 3D Instance matrix must match exact hex-cell center coordinates, NOT floating continuous positions
+      const matrix = new THREE.Matrix4();
+      const pos = new THREE.Vector3();
+      const rot = new THREE.Quaternion();
+      const scale = new THREE.Vector3();
+      occupied.getMatrixAt(0, matrix);
+      matrix.decompose(pos, rot, scale);
+      assert.equal(pos.x, Math.fround(axialToPlane(1, 0).x), 'rendered 3D mesh position must match exact hex-cell center');
     } finally {
       handle.dispose();
     }
@@ -653,8 +662,8 @@ describe('createLiveIsland and applyStep', () => {
       }
       const [alpha, beta] = displayed.towers;
       assert.deepEqual(displayed.springPositions, [
-        alpha.x, 0, alpha.z, frame.positions[2], 0, frame.positions[3],
-        frame.positions[2], 0, frame.positions[3], beta.x, 0, beta.z,
+        frame.positions[0], 0, frame.positions[1], frame.positions[2], 0, frame.positions[3],
+        frame.positions[2], 0, frame.positions[3], frame.positions[4], 0, frame.positions[5],
       ]);
     };
 

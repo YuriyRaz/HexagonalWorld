@@ -995,6 +995,65 @@ describe('command receipt guards', () => {
     });
   }
 
+  test('resolves the layout promise on epoch-success when dragged before initial settlement', async () => {
+    const requestId = 1005;
+    const { runner, workers } = makeHarness();
+    const layoutPromise = runner.runLayout(buildV2Request(requestId));
+    const worker = workers[0];
+
+    // Emit initial ready frame
+    worker.emitMessage(buildV2ReadyResponse(requestId));
+    await Promise.resolve();
+
+    // User drags node -> worker advances epoch to 1 before any initial epoch 0 success
+    const controlPromise = runner.submitForceControl({
+      requestId,
+      action: 'set-fixed-position',
+      entityId: 'leaf-a',
+      x: 10,
+      y: 0,
+    });
+    await Promise.resolve();
+
+    // Acknowledge control result
+    worker.emitMessage({
+      type: 'force-control-result',
+      requestId,
+      commandSeq: 1,
+      accepted: true,
+      epoch: 1,
+      appliedAfterGlobalStep: 0,
+      fixedCount: 1,
+    });
+    await controlPromise;
+
+    const epochStep = buildV2StepResponse(requestId);
+    epochStep.epoch = 1;
+    epochStep.epochStep = 1;
+    worker.emitMessage(epochStep);
+    await Promise.resolve();
+
+    // Settle the layout -> worker returns epoch success for epoch 1
+    const success = buildV2SuccessResponse(requestId);
+    success.type = 'epoch-success';
+    success.epoch = 1;
+    success.globalStep = 2;
+    success.terminalFrame.epoch = 1;
+    success.terminalFrame.epochStep = 2;
+    success.terminalFrame.globalStep = 2;
+    success.result.diagnostics.globalStep = 2;
+    success.result.diagnostics.epoch = 1;
+    
+    worker.emitMessage({ type: 'step', ...success.terminalFrame });
+    await Promise.resolve();
+    worker.emitMessage(success);
+
+    // Expect the layoutPromise to resolve successfully (NOT hang or reject)
+    const result = await layoutPromise;
+    assert.ok(result, 'layout result must resolve');
+    assert.equal(result.diagnostics.epoch, 1, 'resolved layout diagnostics must reflect epoch 1');
+  });
+
   test('rejects assignment revision regression before presentation and cleans the protocol', async () => {
     const requestId = 1001;
     const { runner, workers, timers } = makeHarness();

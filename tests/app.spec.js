@@ -19,7 +19,7 @@ import { calculateAssignmentHash, FORCE_LAYOUT_CONFIG_V2 } from '../src/force-la
 
 const FORCE_MODE = 'force-anchors';
 const BUSY_TEXT = /рассчит|вычисл|формир|строим/i;
-const SUCCESS_TEXT = /готов|заверш|постро|создан|актив/i;
+const SUCCESS_TEXT = /готов|заверш|постро|создан|актив|сошлась/i;
 const RETAINED_TEXT = /не удалось|ошиб|сохран|предыдущ/i;
 
 const DEVICE_PROFILES = {
@@ -1245,5 +1245,146 @@ test.describe('US1 portable force-directed application', { tag: ['@US1-realtime-
       type: 'profile-summary',
       description: `${deviceClass}: ${profile.viewport.width}x${profile.viewport.height}, dpr=${expectedDpr}, mobile=${isMobileProject}, touch=${hasTouch}`,
     });
+  });
+
+  test('[US1] tower dragging works before equilibrium and allows subsequent dragging after settlement', async ({ page }) => {
+    await openApp(page);
+    await expectTestApi(page);
+
+    await page.locator('#layout-algorithm').selectOption(FORCE_MODE);
+    await page.waitForTimeout(500);
+
+    const getVisibleTowerScreenPos = async () => {
+      return page.evaluate(() => {
+        const canvas = document.querySelector('#world');
+        const tiles = window.__hexWorldTest.getTiles();
+        const occupied = tiles.find(t => !t.userData.isEmpty);
+        if (!occupied) return null;
+        const instances = occupied.userData.instances;
+        const THREE = window.__hexWorldTest.THREE;
+        const camera = window.__hexWorldTest.camera;
+        if (!camera) return null;
+
+        const matrix = new THREE.Matrix4();
+        const pos = new THREE.Vector3();
+        const rot = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+
+        for (let i = 0; i < instances.length; i++) {
+          occupied.getMatrixAt(i, matrix);
+          matrix.decompose(pos, rot, scale);
+
+          const worldPos = new THREE.Vector3(pos.x + 3.3, 1, pos.z);
+          const projected = worldPos.clone().project(camera);
+          const screenX = (projected.x * 0.5 + 0.5) * window.innerWidth;
+          const screenY = (-projected.y * 0.5 + 0.5) * window.innerHeight;
+
+        // Visible viewport area: screenX > 80 and top element is canvas
+        if (screenX > 80 && screenX < window.innerWidth - 80 &&
+            screenY > 80 && screenY < window.innerHeight - 80) {
+          const topEl = document.elementFromPoint(screenX, screenY);
+          if (topEl === canvas) {
+            return {
+              entityId: instances[i].payload?.entityId,
+              meshX: pos.x,
+              meshZ: pos.z,
+              screenX,
+              screenY,
+            };
+          }
+        }
+        }
+        return null;
+      });
+    };
+
+    const getMeshPos = async (entityId) => {
+      return page.evaluate((targetId) => {
+        const tiles = window.__hexWorldTest.getTiles();
+        const occupied = tiles.find(t => !t.userData.isEmpty);
+        if (!occupied) return null;
+        const instances = occupied.userData.instances;
+        const idx = instances.findIndex(inst => inst.payload?.entityId === targetId);
+        if (idx === -1) return null;
+
+        const THREE = window.__hexWorldTest.THREE;
+        const matrix = new THREE.Matrix4();
+        const pos = new THREE.Vector3();
+        const rot = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+
+        occupied.getMatrixAt(idx, matrix);
+        matrix.decompose(pos, rot, scale);
+
+        return { x: pos.x, y: pos.y, z: pos.z };
+      }, entityId);
+    };
+
+    const target1 = await getVisibleTowerScreenPos();
+    expect(target1).not.toBeNull();
+
+    const meshPosBefore1 = await getMeshPos(target1.entityId);
+
+    // Perform Drag 1 BEFORE equilibrium
+    await page.mouse.move(target1.screenX, target1.screenY);
+    await page.mouse.down({ button: 'left' });
+    await page.mouse.move(target1.screenX + 30, target1.screenY + 30, { steps: 10 });
+    await page.waitForTimeout(300);
+
+    const meshPosDuring1 = await getMeshPos(target1.entityId);
+    await page.mouse.up({ button: 'left' });
+
+    // Wait for layout status to settle
+    await waitForSuccess(page);
+
+    const target2 = await getVisibleTowerScreenPos();
+    expect(target2).not.toBeNull();
+
+    const meshPosBefore2 = await getMeshPos(target2.entityId);
+
+    // Perform Drag 2 AFTER settlement
+    await page.mouse.move(target2.screenX, target2.screenY);
+    await page.mouse.down({ button: 'left' });
+    await page.mouse.move(target2.screenX - 40, target2.screenY + 40, { steps: 10 });
+    await page.waitForTimeout(300);
+
+    const meshPosDuring2 = await getMeshPos(target2.entityId);
+    await page.mouse.up({ button: 'left' });
+
+    const dist1 = Math.hypot(meshPosDuring1.x - meshPosBefore1.x, meshPosDuring1.z - meshPosBefore1.z);
+    const dist2 = Math.hypot(meshPosDuring2.x - meshPosBefore2.x, meshPosDuring2.z - meshPosBefore2.z);
+
+    // Verify non-dragged towers stay aligned to their assigned hex cell centers (do not float/jiggle)
+    const nonDraggedTowersCoherent = await page.evaluate(() => {
+      const tiles = window.__hexWorldTest.getTiles();
+      const occupied = tiles.find(t => !t.userData.isEmpty);
+      if (!occupied) return false;
+      const instances = occupied.userData.instances;
+      const THREE = window.__hexWorldTest.THREE;
+      const matrix = new THREE.Matrix4();
+      const pos = new THREE.Vector3();
+      const rot = new THREE.Quaternion();
+      const scale = new THREE.Vector3();
+
+      for (let i = 0; i < instances.length; i++) {
+        const inst = instances[i];
+        if (inst.payload?.entityId === window.__hexWorldActiveDragEntityId) continue;
+        occupied.getMatrixAt(i, matrix);
+        matrix.decompose(pos, rot, scale);
+        // Non-dragged towers MUST be positioned exactly at their assigned cell centers
+        if (Math.abs(pos.x - inst.x) > 0.01 || Math.abs(pos.z - inst.z) > 0.01) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    console.log('[TEST LOG] Displacement 1:', dist1);
+    console.log('[TEST LOG] Displacement 2:', dist2);
+    console.log('[TEST LOG] Non-dragged coherent:', nonDraggedTowersCoherent);
+
+    expect(dist1).toBeGreaterThan(0.5);
+    expect(dist2).toBeGreaterThan(0.5);
+    expect(nonDraggedTowersCoherent).toBe(true);
   });
 });

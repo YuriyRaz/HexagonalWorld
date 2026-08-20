@@ -105,6 +105,31 @@ describe('version-2 retained force session', () => {
     session.dispose();
   });
 
+  test('updates cell assignments when dragging a fixed node across multiple hex cells', () => {
+    const session = createForceLayoutSession(request());
+    settle(session);
+
+    const initialAssignmentQ = session.leafNodes.find((n) => n.entityId === 'leaf-a').assignedQ;
+
+    session.enqueueControl({
+      requestId: 41,
+      commandSeq: 1,
+      action: 'set-fixed-position',
+      entityId: 'leaf-a',
+      x: 10,
+      y: 0,
+    });
+
+    for (let i = 0; i < 8; i += 1) {
+      session.advanceOneStep();
+    }
+
+    const updatedAssignmentQ = session.leafNodes.find((n) => n.entityId === 'leaf-a').assignedQ;
+    assert.equal(updatedAssignmentQ, 4, 'fixed node at x=10 must assign to exact Q=4 cell while held');
+    assert.notEqual(updatedAssignmentQ, initialAssignmentQ, 'assignedQ must update across hex cells while held');
+    session.dispose();
+  });
+
   test('synchronous calculation is deterministic and has no post-finish projection', () => {
     const first = calculateForceLayout(request());
     const second = calculateForceLayout(request());
